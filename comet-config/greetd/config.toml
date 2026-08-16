@@ -1,0 +1,13 @@
+[terminal]
+# Let greetd pick an available VT
+vt = "next"
+
+[default_session]
+command = "agreety --cmd /bin/sh"
+user = "greetd"
+
+# Test session: mechanix-comp. Restore phosh with:
+#   cp /etc/greetd/config.toml.phosh.bak /etc/greetd/config.toml
+[initial_session]
+command = "/usr/local/bin/mechanix-test-session"
+user = "mecha"

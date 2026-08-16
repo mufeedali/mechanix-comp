@@ -187,9 +187,12 @@ dependencies = [
 name = "compositor"
 version = "0.1.0"
 dependencies = [
+ "bitflags",
  "smithay",
  "smithay-drm-extras",
  "tracing",
+ "wayland-backend",
+ "wayland-server",
 ]
 
 [[package]]

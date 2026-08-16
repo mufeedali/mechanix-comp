@@ -13,15 +13,14 @@ use smithay::utils::Scale;
 use smithay::wayland::session_lock::LockSurface;
 use smithay::wayland::shell::wlr_layer::Layer;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
-use crate::state::{WindowKind, WindowMode, WindowState};
+use crate::state::{WindowMode, WindowState};
 
 // Background shown behind normal desktop contents.
 pub const CLEAR_COLOR: [f32; 4] = [0.1, 0.1, 0.1, 1.0];
-// Solid red fallback drawn while the session is locked but no lock surface has
-// produced content yet (or the client crashed).
-pub const CLEAR_COLOR_LOCKED: [f32; 4] = [1.0, 0.0, 0.0, 1.0];
+// Behind the lock surface (and while gtklock has not attached a buffer yet).
+pub const CLEAR_COLOR_LOCKED: [f32; 4] = [0.08, 0.08, 0.08, 1.0];
 
 smithay::backend::renderer::element::render_elements! {
     pub OutputElements<R, E> where R: ImportAll + ImportMem;
@@ -50,12 +49,30 @@ pub fn output_elements(
     output: &Output,
     is_locked: bool,
     lock_surfaces: &[LockSurface],
+    lock_layers: &[LayerSurface],
     toplevels: &HashMap<WlSurface, WindowState>,
+    visible: &HashSet<WlSurface>,
 ) -> (Vec<Element>, [f32; 4]) {
     if is_locked {
-        // Only render live lock surfaces. Dead surfaces (client crashed) produce
-        // no elements and fall back to the solid red clear color.
+        let scale = output.current_scale().fractional_scale();
+        let map = layer_map_for_output(output);
         let mut elements = Vec::new();
+        for surface in map.layers().rev().filter(|s| lock_layers.contains(s)) {
+            let Some(geo) = map.layer_geometry(surface) else {
+                continue;
+            };
+            elements.extend(
+                surface
+                    .render_elements::<WaylandSurfaceRenderElement<GlesRenderer>>(
+                        renderer,
+                        geo.loc.to_physical_precise_round(scale),
+                        Scale::from(scale),
+                        1.0,
+                    )
+                    .into_iter()
+                    .map(OutputElements::Surface),
+            );
+        }
         for lock_surface in lock_surfaces.iter().filter(|s| s.alive()) {
             elements.extend(
                 render_elements_from_surface_tree::<
@@ -65,7 +82,7 @@ pub fn output_elements(
                     renderer,
                     lock_surface.wl_surface(),
                     (0, 0),
-                    output.current_scale().fractional_scale(),
+                    scale,
                     1.0,
                     Kind::Unspecified,
                 )
@@ -77,25 +94,6 @@ pub fn output_elements(
     } else {
         let scale = output.current_scale().fractional_scale();
         let mut elements: Vec<Element> = Vec::new();
-
-        // Transients (tooltip fallbacks) render above everything, like the
-        // xdg_popup tooltips they stand in for.
-        for (window, loc) in toplevels.values().filter_map(|ws| match ws.kind {
-            WindowKind::Transient(loc) => Some((&ws.window, loc)),
-            _ => None,
-        }) {
-            elements.extend(
-                window
-                    .render_elements::<WaylandSurfaceRenderElement<GlesRenderer>>(
-                        renderer,
-                        loc.to_physical_precise_round(scale),
-                        Scale::from(scale),
-                        1.0,
-                    )
-                    .into_iter()
-                    .map(|e| OutputElements::Space(SpaceRenderElements::Element(Wrap::from(e)))),
-            );
-        }
 
         // Split the layer map exactly like smithay's `space_render_elements`:
         // upper = Top/Overlay, lower = Background/Bottom (insertion order,
@@ -111,8 +109,7 @@ pub fn output_elements(
         let (overlay, top): (Vec<&LayerSurface>, Vec<&LayerSurface>) =
             upper.into_iter().partition(|s| s.layer() == Layer::Overlay);
 
-        // Overlay layers (and their popups) above everything but the
-        // transients.
+        // Overlay layers (and their popups) above everything.
         for surface in &overlay {
             let Some(geo) = map.layer_geometry(surface) else {
                 continue;
@@ -206,10 +203,19 @@ pub fn output_elements(
 
         // The windows.
         if let Some(output_geo) = space.output_geometry(output) {
+            let in_visible = |window: &Window| {
+                window
+                    .toplevel()
+                    .is_some_and(|t| visible.contains(t.wl_surface()))
+            };
             if space.elements().any(is_fullscreen) {
                 // Fullscreen windows were rendered above; render the rest
-                // individually so they stay below the Top layer.
+                // individually so they stay below the Top layer. Hidden
+                // (non-visible) windows are skipped.
                 for window in space.elements().rev().filter(|w| !is_fullscreen(w)) {
+                    if !in_visible(window) {
+                        continue;
+                    }
                     let loc = space.element_location(window).unwrap() - output_geo.loc;
                     elements.extend(
                         window
@@ -225,8 +231,8 @@ pub fn output_elements(
                             }),
                     );
                 }
-            } else {
-                // Fast path: no fullscreen windows, render the whole space at
+            } else if visible.len() == space.elements().count() {
+                // Fast path: every window is visible, render the whole space at
                 // once.
                 elements.extend(
                     space
@@ -236,6 +242,28 @@ pub fn output_elements(
                             OutputElements::Space(SpaceRenderElements::Element(Wrap::from(e)))
                         }),
                 );
+            } else {
+                // Only a subset is visible (e.g. Comet's active group): render
+                // those individually so the rest stay hidden.
+                for window in space.elements().rev() {
+                    if !in_visible(window) {
+                        continue;
+                    }
+                    let loc = space.element_location(window).unwrap() - output_geo.loc;
+                    elements.extend(
+                        window
+                            .render_elements::<WaylandSurfaceRenderElement<GlesRenderer>>(
+                                renderer,
+                                loc.to_physical_precise_round(scale),
+                                Scale::from(scale),
+                                1.0,
+                            )
+                            .into_iter()
+                            .map(|e| {
+                                OutputElements::Space(SpaceRenderElements::Element(Wrap::from(e)))
+                            }),
+                    );
+                }
             }
         }
 

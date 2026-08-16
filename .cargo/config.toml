@@ -1,0 +1,5 @@
+[target.aarch64-unknown-linux-gnu]
+# Rust's default linker selection for cross GNU targets passes -fuse-ld flags the
+# GCC driver rejects; using the aarch64 cross compiler explicitly sidesteps that.
+# The wrapper at /usr/local/bin normalizes rustc's '-fuse-ld=wild' to bfd.
+linker = "/usr/local/bin/aarch64-linux-gnu-gcc"

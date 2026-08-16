@@ -3,18 +3,19 @@ use std::ffi::OsString;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use smithay::desktop::{PopupManager, Space, Window, layer_map_for_output};
+use smithay::desktop::{LayerSurface, PopupManager, Space, Window, layer_map_for_output};
 use smithay::input::keyboard::Keysym;
 use smithay::input::{Seat, SeatState};
 use smithay::output::Output;
 use smithay::reexports::calloop::{
-    EventLoop, Interest, LoopSignal, Mode, PostAction, generic::Generic,
+    EventLoop, Interest, LoopHandle, LoopSignal, Mode, PostAction, RegistrationToken,
+    generic::Generic,
 };
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 use smithay::reexports::wayland_server::Resource;
 use smithay::reexports::wayland_server::backend::{ClientData, ClientId, DisconnectReason};
 use smithay::reexports::wayland_server::{Display, DisplayHandle};
-use smithay::utils::{Logical, Point, SERIAL_COUNTER};
+use smithay::utils::SERIAL_COUNTER;
 use smithay::wayland::compositor::{CompositorClientState, CompositorState, with_states};
 use smithay::wayland::dmabuf::{DmabufGlobal, DmabufState};
 use smithay::wayland::foreign_toplevel_list::ForeignToplevelListState;
@@ -35,27 +36,18 @@ use smithay::wayland::socket::ListeningSocketSource;
 use smithay::wayland::text_input::TextInputManagerState;
 use smithay::wayland::viewporter::ViewporterState;
 use smithay::wayland::virtual_keyboard::VirtualKeyboardManagerState;
+
 use smithay::wayland::xdg_activation::XdgActivationState;
 use smithay::wayland::xdg_toplevel_icon::XdgToplevelIconManager;
 
+use smithay::reexports::wayland_server::backend::GlobalId;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 
 use crate::backend::Backend;
+use crate::handlers::device_state::{DEVICE_STATE_VERSION, DeviceStateUdata};
 use crate::handlers::foreign_toplevel::ForeignToplevelManagerState;
-
-/// What a toplevel *is*, decided at the first commit from client-declared
-/// facts (parent, title/app_id, dialog hint).
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub enum WindowKind {
-    /// A regular toplevel: subject to the maximize/fullscreen policy.
-    Normal,
-    /// A dialog: never maximized/fullscreen, kept centered over its parent.
-    Dialog,
-    /// A parentless, untitled toplevel (GTK3 tooltip fallback that couldn't
-    /// become an xdg_popup): rendered above windows, never focused, kept out
-    /// of the `Space`; the compositor positions it.
-    Transient(Point<i32, Logical>),
-}
+use crate::handlers::output_power::OutputPowerManagerState;
+use crate::handlers::phoc_device_state::zphoc_device_state_v1::ZphocDeviceStateV1;
 
 /// How a toplevel is arranged right now.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -72,9 +64,8 @@ pub enum WindowMode {
 /// `State::toplevels` by its `wl_surface`.
 pub struct WindowState {
     pub window: Window,
-    pub kind: WindowKind,
     pub mode: WindowMode,
-    /// True once first-commit handling ran; transients are marked too, though they never join the `Space`.
+    /// True once first-commit handling ran and the window joined the `Space`.
     pub mapped: bool,
     /// The xdg-dialog modal hint, cached so input handling needn't lock
     /// surface data on every click.
@@ -88,6 +79,7 @@ pub struct State<BackendData: Backend + 'static> {
 
     pub space: Space<Window>,
     pub loop_signal: LoopSignal,
+    pub loop_handle: LoopHandle<'static, Self>,
 
     /// All xdg toplevels ever created, keyed by `wl_surface`, whether or not
     /// mapped into `space` yet (mapping happens on the first commit). Dead
@@ -121,12 +113,17 @@ pub struct State<BackendData: Backend + 'static> {
     pub viewporter_state: ViewporterState,
     pub foreign_toplevel: ForeignToplevelManagerState,
     pub foreign_toplevel_list: ForeignToplevelListState,
+    pub output_power: OutputPowerManagerState,
     pub xdg_toplevel_icon: XdgToplevelIconManager,
     pub xdg_dialog_state: XdgDialogState,
     pub idle_notifier_state: IdleNotifierState<State<BackendData>>,
     pub idle_inhibit_manager_state: IdleInhibitManagerState,
     pub data_control_state: DataControlState,
     pub fractional_scale_manager_state: FractionalScaleManagerState,
+    /// phoc's `zphoc_device_state_v1` global; stevia requires it before its
+    /// Wayland connection is "ready", so it can create its OSK surface.
+    pub device_state_global: GlobalId,
+    pub layouts: HashMap<Output, crate::layout::Layout>,
     /// Surfaces holding an active `zwp_idle_inhibitor_v1`; while non-empty the
     /// idle notifier is inhibited.
     pub idle_inhibiting_surfaces: HashSet<WlSurface>,
@@ -140,6 +137,12 @@ pub struct State<BackendData: Backend + 'static> {
     /// Held between `lock()` and the first submitted locked frame.
     /// Calling `.lock()` on this sends the `locked` event to the client.
     pub pending_lock: Option<SessionLocker>,
+    /// Live timer for a held power key (long-press → power menu).
+    pub power_timer: Option<RegistrationToken>,
+    /// True once the long-press timer has fired; release then must not DPMS-toggle.
+    pub power_long_fired: bool,
+    /// nwg-bar is up; a tap that misses it dismisses the menu.
+    pub power_menu_live: bool,
 }
 
 impl<BackendData: Backend + 'static> State<BackendData> {
@@ -181,8 +184,11 @@ impl<BackendData: Backend + 'static> State<BackendData> {
 
         let session_lock_state = SessionLockManagerState::new::<Self, _>(&dh, |_| true);
         let viewporter_state = ViewporterState::new::<Self>(&dh);
+        let device_state_global =
+            dh.create_global::<Self, ZphocDeviceStateV1, _>(DEVICE_STATE_VERSION, DeviceStateUdata);
         let foreign_toplevel = ForeignToplevelManagerState::new::<Self>(&dh);
         let foreign_toplevel_list = ForeignToplevelListState::new::<Self>(&dh);
+        let output_power = OutputPowerManagerState::new::<Self>(&dh);
         let mut xdg_toplevel_icon = XdgToplevelIconManager::new::<Self>(&dh);
         xdg_toplevel_icon.add_icon_size(64);
         let xdg_dialog_state = XdgDialogState::new::<Self>(&dh);
@@ -196,6 +202,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
 
         let socket_name = Self::init_wayland_listener(display, event_loop);
         let loop_signal = event_loop.get_signal();
+        let loop_handle = event_loop.handle();
 
         Self {
             start_time,
@@ -204,6 +211,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
             space,
             toplevels: HashMap::new(),
             loop_signal,
+            loop_handle,
             compositor_state,
             xdg_shell_state,
             xdg_decoration_state,
@@ -223,8 +231,11 @@ impl<BackendData: Backend + 'static> State<BackendData> {
             is_locked: false,
             lock_surfaces: Vec::new(),
             viewporter_state,
+            device_state_global,
+            layouts: HashMap::new(),
             foreign_toplevel,
             foreign_toplevel_list,
+            output_power,
             xdg_toplevel_icon,
             xdg_dialog_state,
             idle_notifier_state,
@@ -235,6 +246,9 @@ impl<BackendData: Backend + 'static> State<BackendData> {
             layer_shell_on_demand_focus: None,
             active_window: None,
             pending_lock: None,
+            power_timer: None,
+            power_long_fired: false,
+            power_menu_live: false,
         }
     }
 
@@ -269,9 +283,15 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         socket_name
     }
 
-    /// Send frame callbacks to every visible surface on `output`, once per
-    /// presented frame. Lifecycle bookkeeping happens in the backends' idle
-    /// callbacks instead, so client I/O isn't blocked on frame presentation.
+    /// Queue a redraw on every output. Coalesced by the backend.
+    pub fn schedule_render(&mut self) {
+        let outputs: Vec<Output> = self.space.outputs().cloned().collect();
+        for output in &outputs {
+            self.backend_data.schedule_render(output);
+        }
+    }
+
+    /// Deliver pending `wl_surface.frame` callbacks, including for off-screen surfaces.
     pub fn send_frame_callbacks(&mut self, output: &Output) {
         let now = self.start_time.elapsed();
         if self.is_locked {
@@ -284,6 +304,14 @@ impl<BackendData: Backend + 'static> State<BackendData> {
                     Some(Duration::ZERO),
                     |_, _| Some(output.clone()),
                 );
+            }
+            for layer_surface in layer_map_for_output(output).layers() {
+                if !self.is_lock_privileged_layer(layer_surface) {
+                    continue;
+                }
+                layer_surface.send_frame(output, now, Some(Duration::ZERO), |_, _| {
+                    Some(output.clone())
+                });
             }
 
             // Send `locked` once a live lock surface has been registered.
@@ -304,12 +332,6 @@ impl<BackendData: Backend + 'static> State<BackendData> {
                     Some(output.clone())
                 });
                 self.push_fractional_scale(layer_surface.wl_surface(), scale);
-            }
-            for (window, _) in self.transient_windows() {
-                window.send_frame(output, now, Some(Duration::ZERO), |_, _| {
-                    Some(output.clone())
-                });
-                self.push_fractional_scale(window.toplevel().unwrap().wl_surface(), scale);
             }
         }
     }
@@ -334,14 +356,6 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         self.idle_notifier_state.set_is_inhibited(inhibited);
     }
 
-    /// The tracked transient tooltip fallbacks and their positions.
-    pub fn transient_windows(&self) -> impl Iterator<Item = (&Window, Point<i32, Logical>)> {
-        self.toplevels.values().filter_map(|ws| match ws.kind {
-            WindowKind::Transient(loc) => Some((&ws.window, loc)),
-            _ => None,
-        })
-    }
-
     /// The topmost window currently in `Fullscreen` mode, if any. While one is
     /// active it is rendered above the top layer and keeps keyboard focus.
     pub fn active_fullscreen_window(&self) -> Option<Window> {
@@ -364,6 +378,9 @@ impl<BackendData: Backend + 'static> State<BackendData> {
     pub fn cleanup_toplevels(&mut self) {
         self.toplevels
             .retain(|_, ws| ws.window.toplevel().unwrap().wl_surface().is_alive());
+        for layout in self.layouts.values_mut() {
+            layout.retain(|s| s.is_alive());
+        }
         // Prune dead idle-inhibitor surfaces and re-evaluate.
         self.idle_inhibiting_surfaces
             .retain(|surface| surface.is_alive());
@@ -382,7 +399,12 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         }
         let focus = self.compute_keyboard_focus();
         if keyboard.current_focus().as_ref() != focus.as_ref() {
-            keyboard.set_focus(self, focus, SERIAL_COUNTER.next_serial());
+            let serial = SERIAL_COUNTER.next_serial();
+            if focus.is_none() {
+                self.clear_keyboard_focus(serial);
+            } else {
+                keyboard.set_focus(self, focus, serial);
+            }
         }
     }
 
@@ -417,6 +439,19 @@ impl<BackendData: Backend + 'static> State<BackendData> {
                 })
                 .map(|layer| layer.wl_surface().clone())
         })
+    }
+
+    // # SHELL-HELL: stevia's OSK is a Top layer; show that whole band on the lock screen.
+    pub fn is_lock_privileged_layer(&self, layer: &LayerSurface) -> bool {
+        layer.layer() == Layer::Top
+    }
+
+    pub fn lock_privileged_layers(&self, output: &Output) -> Vec<LayerSurface> {
+        layer_map_for_output(output)
+            .layers()
+            .filter(|layer| self.is_lock_privileged_layer(layer))
+            .cloned()
+            .collect()
     }
 
     /// Whether `surface` is still a mapped layer with `OnDemand` interactivity.

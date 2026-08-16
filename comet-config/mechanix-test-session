@@ -1,0 +1,95 @@
+#!/bin/bash
+# Boot session for testing mechanix-comp. The compositor runs in a loop, so
+# `pkill -x compositor` (e.g. from scripts/push-compositor.sh) hot-reloads the
+# new binary without a reboot. After each compositor start, launch the default
+# client set: waybar (task switch) + nwg-drawer (app launch), gtk4-demo, stevia.
+# Screen off: compositor (power key / zwlr_output_power).
+# Idle: 60s wlopm --off DSI-1, 65s gtklock.
+# Long-press power: compositor spawns nwg-bar.
+# No `set -e`: killing the compositor (SIGTERM -> non-zero wait) must NOT end
+# the session.
+
+export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+mkdir -p "$XDG_RUNTIME_DIR" 2>/dev/null || true
+
+# The compositor picks its backend from WAYLAND_DISPLAY presence: unset it so it
+# drives the udev/DRM backend from this VT (same seat access as phoc).
+unset WAYLAND_DISPLAY DISPLAY
+
+# The seat's "primary GPU" resolves to etnaviv (card0), which has no modeset.
+# The DSI panel is on imx-lcdif card2, so point the compositor at it.
+export MECHA_DRM_DEVICE=/dev/dri/card2
+
+# Reuse the systemd user session bus; gsettings/dconf clients need it.
+export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
+
+# If seatd is running (SSH / leftover from a mid-boot switch), use it.
+# Otherwise libseat uses logind (greetd session).
+if [ -S /run/seatd.sock ]; then
+    export LIBSEAT_BACKEND=seatd
+fi
+
+# GTK4 (4.22) is linked against GStreamer 1.28 (`gst_gl_display_x11_new_with_display`).
+# Those libs live in /opt/gst128 and are not in the ld.so cache. Login shells get
+# /opt/gstreamer (1.26) from /etc/profile.d/libcamera.sh, which is too old.
+# greetd does not source profile.d. /opt/libcamera is already in ld.so.conf.d.
+export LD_LIBRARY_PATH="/opt/gst128/usr/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+
+launch_defaults() {
+    # Truncated comms: phosh-osk-stevia -> phosh-osk-stev, nwg-drawer -> nwg-drawer
+    pkill -x waybar 2>/dev/null || true
+    pkill -x nwg-drawer 2>/dev/null || true
+    pkill -x gtk4-demo 2>/dev/null || true
+    pkill -x phosh-osk-stevi 2>/dev/null || true
+    pkill -x swayidle 2>/dev/null || true
+    pkill -x nwg-bar 2>/dev/null || true
+    sleep 0.2
+
+    # Resident drawer so the waybar button toggles it. Do not -close until
+    # the window exists: SIGUSR/SIGRTMIN+3 on a nil win panics this 0.4.9.
+    rm -f "${XDG_DATA_HOME:-$HOME/.local/share}/nwg-drawer.lock"
+    nwg-drawer -r -k -nocats -nofs -c 3 -is 48 -spacing 12 >/tmp/nwg-drawer.log 2>&1 &
+    waybar >/tmp/waybar.log 2>&1 &
+    gtk4-demo >/tmp/gtk4-demo.log 2>&1 &
+    /usr/bin/phosh-osk-stevia >/tmp/osk.log 2>&1 &
+    (sleep 4 && nwg-drawer -close) >/dev/null 2>&1 &
+    # Screen off first, lock 5s later. This wlopm build needs `--off <name>`.
+    swayidle -w \
+        timeout 60 'wlopm --off DSI-1' \
+        timeout 65 'gtklock -d' \
+        >/tmp/swayidle.log 2>&1 &
+}
+
+while true; do
+    # WAYLAND_DISPLAY must stay unset so the compositor picks the udev/DRM
+    # backend; it's exported for clients only via mecha-session.env.
+    unset WAYLAND_DISPLAY DISPLAY
+    rm -f "$XDG_RUNTIME_DIR"/wayland-* "$XDG_RUNTIME_DIR"/mecha-session.env 2>/dev/null || true
+
+    /usr/local/bin/compositor > /tmp/compositor.log 2>&1 &
+    COMPOSITOR_PID=$!
+
+    WAYLAND_DISPLAY=""
+    for i in $(seq 1 150); do
+        sock=$(ls -d "$XDG_RUNTIME_DIR"/wayland-* 2>/dev/null | grep -v '\.lock$' | head -1 || true)
+        if [ -n "$sock" ]; then WAYLAND_DISPLAY=$(basename "$sock"); break; fi
+        sleep 0.1
+    done
+
+    if [ -n "$WAYLAND_DISPLAY" ]; then
+        export WAYLAND_DISPLAY
+        cat > "$XDG_RUNTIME_DIR/mecha-session.env" <<EOF
+export WAYLAND_DISPLAY=$WAYLAND_DISPLAY
+export XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR
+export DBUS_SESSION_BUS_ADDRESS=$DBUS_SESSION_BUS_ADDRESS
+export LD_LIBRARY_PATH=$LD_LIBRARY_PATH
+EOF
+        chmod 600 "$XDG_RUNTIME_DIR/mecha-session.env"
+        launch_defaults
+    fi
+
+    wait "$COMPOSITOR_PID"
+    RC=$?
+    echo "compositor exited rc=$RC at $(date +%H:%M:%S) socket='$WAYLAND_DISPLAY'" >> /tmp/compositor-exit.log
+    sleep 2
+done

@@ -108,7 +108,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 // Re-arrange layers for the new size, keeping toplevels filling
                 // the (possibly changed) non-exclusive zone.
                 layer_map_for_output(&output).arrange();
-                state.reflow_toplevels();
+                state.apply_layout(&output);
 
                 if state.is_locked {
                     let logical_size = state.space.output_geometry(&output).map(|geo| geo.size);
@@ -127,6 +127,8 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 let damage = Rectangle::from_size(size);
 
                 {
+                    let visible = state.visible_surfaces(&output);
+                    let lock_layers = state.lock_privileged_layers(&output);
                     let (renderer, mut framebuffer) = state.backend_data.backend.bind().unwrap();
                     let (elements, clear_color) = output_elements(
                         renderer,
@@ -134,7 +136,9 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                         &output,
                         state.is_locked,
                         &state.lock_surfaces,
+                        &lock_layers,
                         &state.toplevels,
+                        &visible,
                     );
                     damage_tracker
                         .render_output(renderer, &mut framebuffer, 0, &elements, clear_color)

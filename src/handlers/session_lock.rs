@@ -1,5 +1,6 @@
 use crate::backend::Backend;
 use crate::state::State;
+use smithay::input::keyboard::XkbConfig;
 use smithay::reexports::wayland_server::protocol::wl_output::WlOutput;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::SERIAL_COUNTER;
@@ -17,10 +18,7 @@ impl<BackendData: Backend + 'static> SessionLockHandler for State<BackendData> {
 
         // Clear keyboard focus from all normal clients immediately so they
         // cannot receive input while we are transitioning to the locked state.
-        let serial = SERIAL_COUNTER.next_serial();
-        if let Some(keyboard) = self.seat.get_keyboard() {
-            keyboard.set_focus(self, Option::<WlSurface>::None, serial);
-        }
+        self.clear_keyboard_focus(SERIAL_COUNTER.next_serial());
 
         // Defer sending the `locked` event until the render loop has submitted
         // a locked frame to the screen (protocol requirement: the locked event
@@ -32,6 +30,8 @@ impl<BackendData: Backend + 'static> SessionLockHandler for State<BackendData> {
         self.is_locked = false;
         self.lock_surfaces.clear();
         self.focus_topmost();
+        // The lock frame is still on the CRTC until the next redraw.
+        self.schedule_render();
     }
 
     fn new_surface(&mut self, surface: LockSurface, wl_output: WlOutput) {
@@ -52,6 +52,8 @@ impl<BackendData: Backend + 'static> SessionLockHandler for State<BackendData> {
         if self.lock_surfaces.is_empty() {
             let serial = SERIAL_COUNTER.next_serial();
             if let Some(keyboard) = self.seat.get_keyboard() {
+                // gtklock binds after the OSK keymap was already advertised.
+                let _ = keyboard.set_xkb_config(self, XkbConfig::default());
                 keyboard.set_focus(self, Some(surface.wl_surface().clone()), serial);
             }
         }

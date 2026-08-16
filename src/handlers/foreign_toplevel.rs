@@ -3,6 +3,7 @@
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 
+use smithay::backend::renderer::utils::RendererSurfaceStateUserData;
 use smithay::output::Output;
 use smithay::reexports::wayland_protocols::ext::foreign_toplevel_list::v1::server::ext_foreign_toplevel_handle_v1::ExtForeignToplevelHandleV1;
 use smithay::reexports::wayland_protocols_wlr::foreign_toplevel::v1::server::{
@@ -24,7 +25,7 @@ use smithay::wayland::shell::xdg::XdgToplevelSurfaceData;
 use smithay::wayland::{Dispatch2, GlobalDispatch2};
 
 use crate::backend::Backend;
-use crate::state::{State, WindowKind, WindowMode};
+use crate::state::{State, WindowMode};
 
 const WLR_MANAGEMENT_VERSION: u32 = 3;
 
@@ -41,6 +42,8 @@ pub struct ToplevelData {
     states: Vec<u8>,
     /// The output the toplevel is currently on, for `output_enter`/`leave`.
     output: Option<Output>,
+    /// xdg parent, if any; the wlr `parent` event is sent once handles exist.
+    parent: Option<WlSurface>,
     /// Per-client wlr handles, each with the outputs entered so far.
     wlr_management_instances: HashMap<ZwlrForeignToplevelHandleV1, Vec<WlOutput>>,
     /// smithay's ext-list handle; owns all ext instance bookkeeping.
@@ -53,7 +56,8 @@ impl ToplevelData {
         handle: &DisplayHandle,
         client: &Client,
         manager: &ZwlrForeignToplevelManagerV1,
-    ) where
+    ) -> Option<ZwlrForeignToplevelHandleV1>
+    where
         D: Dispatch<ZwlrForeignToplevelHandleV1, ForeignToplevelUdata> + 'static,
     {
         let Ok(toplevel) = client.create_resource::<ZwlrForeignToplevelHandleV1, _, D>(
@@ -61,13 +65,13 @@ impl ToplevelData {
             manager.version(),
             ForeignToplevelUdata,
         ) else {
-            return;
+            return None;
         };
         manager.toplevel(&toplevel);
 
         toplevel.title(self.title.clone());
         toplevel.app_id(self.app_id.clone());
-        toplevel.state(self.states.clone());
+        toplevel.state(state_for_version(&self.states, toplevel.version()));
 
         let mut outputs = Vec::new();
         if let Some(output) = &self.output {
@@ -77,9 +81,9 @@ impl ToplevelData {
             }
         }
 
-        toplevel.done();
-
-        self.wlr_management_instances.insert(toplevel, outputs);
+        self.wlr_management_instances
+            .insert(toplevel.clone(), outputs);
+        Some(toplevel)
     }
 }
 
@@ -90,6 +94,7 @@ struct ToplevelSnapshot {
     app_id: String,
     states: Vec<u8>,
     output: Option<Output>,
+    parent: Option<WlSurface>,
 }
 
 /// The foreign-toplevel module state, held by [`State`].
@@ -127,9 +132,9 @@ impl ForeignToplevelManagerState {
             + Dispatch<ZwlrForeignToplevelHandleV1, ForeignToplevelUdata>
             + 'static,
     {
-        // 1. Close toplevels that are gone (destroyed, crashed or transient).
+        let live: HashSet<_> = snapshots.iter().map(|s| s.surface.clone()).collect();
         self.toplevels.retain(|surface, data| {
-            let keep = snapshots.iter().any(|snap| snap.surface == *surface);
+            let keep = live.contains(surface);
             if !keep {
                 if let Some(handle) = data.ext_handle.take() {
                     list.remove_toplevel(&handle);
@@ -141,9 +146,10 @@ impl ForeignToplevelManagerState {
             keep
         });
 
-        // 2. Create or update the remaining toplevels.
+        let mut parent_targets = HashSet::new();
+
         for snap in snapshots {
-            match self.toplevels.entry(snap.surface) {
+            match self.toplevels.entry(snap.surface.clone()) {
                 Entry::Occupied(mut entry) => {
                     let data = entry.get_mut();
 
@@ -159,7 +165,6 @@ impl ForeignToplevelManagerState {
                         new_app_id = Some(snap.app_id.clone());
                     }
 
-                    // ext handle stays in sync with the diff above, so only touch it on changes.
                     if (new_title.is_some() || new_app_id.is_some())
                         && let Some(handle) = &data.ext_handle
                     {
@@ -184,6 +189,11 @@ impl ForeignToplevelManagerState {
                         output_changed = true;
                     }
 
+                    if data.parent != snap.parent {
+                        data.parent = snap.parent.clone();
+                        parent_targets.insert(snap.surface.clone());
+                    }
+
                     if new_title.is_some()
                         || new_app_id.is_some()
                         || states_changed
@@ -197,7 +207,7 @@ impl ForeignToplevelManagerState {
                                 instance.app_id(app_id.clone());
                             }
                             if states_changed {
-                                instance.state(snap.states.clone());
+                                instance.state(state_for_version(&snap.states, instance.version()));
                             }
                             if output_changed {
                                 for wl_output in outputs.drain(..) {
@@ -216,7 +226,6 @@ impl ForeignToplevelManagerState {
                         }
                     }
 
-                    // Clean up dead wl_outputs.
                     for outputs in data.wlr_management_instances.values_mut() {
                         outputs.retain(|wl_output| wl_output.is_alive());
                     }
@@ -227,6 +236,7 @@ impl ForeignToplevelManagerState {
                         app_id: snap.app_id,
                         states: snap.states,
                         output: snap.output,
+                        parent: snap.parent,
                         wlr_management_instances: HashMap::new(),
                         ext_handle: None,
                     };
@@ -237,11 +247,54 @@ impl ForeignToplevelManagerState {
                             data.add_wlr_instance::<D>(dh, &client, manager);
                         }
                     }
-
+                    parent_targets.insert(snap.surface.clone());
                     entry.insert(data);
                 }
             }
         }
+
+        let children: Vec<_> = self
+            .toplevels
+            .iter()
+            .filter(|(_, data)| {
+                data.parent
+                    .as_ref()
+                    .is_some_and(|p| parent_targets.contains(p))
+            })
+            .map(|(s, _)| s.clone())
+            .collect();
+        parent_targets.extend(children);
+
+        for surface in &parent_targets {
+            self.send_wlr_parent(surface);
+        }
+    }
+
+    fn send_wlr_parent(&self, surface: &WlSurface) {
+        let Some(data) = self.toplevels.get(surface) else {
+            return;
+        };
+        let instances: Vec<_> = data.wlr_management_instances.keys().cloned().collect();
+        for instance in &instances {
+            self.send_parent_to(surface, instance);
+        }
+    }
+
+    fn send_parent_to(&self, surface: &WlSurface, instance: &ZwlrForeignToplevelHandleV1) {
+        if instance.version() >= 3 {
+            let parent = self.toplevels.get(surface).and_then(|data| {
+                let parent = data.parent.as_ref()?;
+                let client = instance.client()?;
+                self.toplevels
+                    .get(parent)?
+                    .wlr_management_instances
+                    .keys()
+                    .find(|h| h.client().as_ref() == Some(&client))
+                    .cloned()
+            });
+            instance.parent(parent.as_ref());
+        }
+        instance.done();
     }
 
     fn surface_for_wlr_handle(&self, resource: &ZwlrForeignToplevelHandleV1) -> Option<WlSurface> {
@@ -259,6 +312,21 @@ impl ForeignToplevelManagerState {
 }
 
 /// The wlr `state` payload for a toplevel in `mode` with `focused` focus.
+/// wlr `Activated` is keyboard focus (one window): fcitx/sfwbar treat it as that, unlike xdg `Activated` on the group.
+/// Drop `fullscreen` (v2) from the state array for older handles.
+fn state_for_version(states: &[u8], version: u32) -> Vec<u8> {
+    if version >= 2 {
+        return states.to_vec();
+    }
+    let fullscreen = (zwlr_foreign_toplevel_handle_v1::State::Fullscreen as u32).to_ne_bytes();
+    states
+        .chunks_exact(4)
+        .filter(|chunk| *chunk != fullscreen)
+        .flatten()
+        .copied()
+        .collect()
+}
+
 fn to_state_vec(mode: WindowMode, focused: bool) -> Vec<u8> {
     let mut states = Vec::new();
     if matches!(mode, WindowMode::Maximized) {
@@ -271,6 +339,16 @@ fn to_state_vec(mode: WindowMode, focused: bool) -> Vec<u8> {
         states.extend((zwlr_foreign_toplevel_handle_v1::State::Activated as u32).to_ne_bytes());
     }
     states
+}
+
+/// True once the surface has committed a buffer (xdg mapped).
+fn has_buffer(surface: &WlSurface) -> bool {
+    with_states(surface, |states| {
+        states
+            .data_map
+            .get::<RendererSurfaceStateUserData>()
+            .is_some_and(|s| s.lock().unwrap().buffer().is_some())
+    })
 }
 
 /// The toplevel's current title and app_id.
@@ -294,7 +372,11 @@ impl<BackendData: Backend + 'static> State<BackendData> {
 
         let mut snapshots: Vec<ToplevelSnapshot> = Vec::new();
         for (surface, ws) in &self.toplevels {
-            if matches!(ws.kind, WindowKind::Transient(_)) || !surface.is_alive() {
+            if !surface.is_alive() || !has_buffer(surface) {
+                continue;
+            }
+            // # TO REMOVE: list group roots only.
+            if ws.window.toplevel().is_some_and(|t| t.parent().is_some()) {
                 continue;
             }
             let (title, app_id) = foreign_toplevel_title_app_id(surface);
@@ -304,12 +386,14 @@ impl<BackendData: Backend + 'static> State<BackendData> {
                 .outputs_for_element(&ws.window)
                 .into_iter()
                 .next();
+            let parent = ws.window.toplevel().and_then(|t| t.parent());
             snapshots.push(ToplevelSnapshot {
                 surface: surface.clone(),
                 title,
                 app_id,
                 states,
                 output,
+                parent,
             });
         }
 
@@ -364,8 +448,17 @@ impl<BackendData: Backend + 'static>
     ) {
         let manager = data_init.init(resource, ForeignToplevelUdata);
 
-        for data in state.foreign_toplevel.toplevels.values_mut() {
-            data.add_wlr_instance::<State<BackendData>>(dh, client, &manager);
+        let surfaces: Vec<_> = state.foreign_toplevel.toplevels.keys().cloned().collect();
+        let mut new_handles = Vec::new();
+        for surface in surfaces {
+            let data = state.foreign_toplevel.toplevels.get_mut(&surface).unwrap();
+            if let Some(handle) = data.add_wlr_instance::<State<BackendData>>(dh, client, &manager)
+            {
+                new_handles.push((surface, handle));
+            }
+        }
+        for (surface, handle) in &new_handles {
+            state.foreign_toplevel.send_parent_to(surface, handle);
         }
 
         state

@@ -1,12 +1,15 @@
 pub mod compositor;
 pub mod data_control;
 pub mod data_device;
+pub mod device_state;
 pub mod dmabuf;
 pub mod foreign_toplevel;
 pub mod fractional_scale;
 pub mod idle;
 pub mod layer_shell;
 pub mod output;
+pub mod output_power;
+pub mod phoc_device_state;
 pub mod seat;
 pub mod session_lock;
 pub mod shm;

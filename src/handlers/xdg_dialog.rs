@@ -9,7 +9,7 @@ impl<BackendData: Backend + 'static> XdgDialogHandler for State<BackendData> {
         toplevel: smithay::wayland::shell::xdg::ToplevelSurface,
         hint: ToplevelDialogHint,
     ) {
-        // Cache the hint so input handling doesn't lock surface data per click.
+        // Cache modal so input handling doesn't lock surface data per click.
         if let Some(ws) = self.toplevels.get_mut(toplevel.wl_surface()) {
             ws.modal = hint == ToplevelDialogHint::Modal;
         }

@@ -1,0 +1,17 @@
+#!/bin/bash
+# Launch a command inside the running mechanix test session from an SSH login.
+# Usage: mecha-run <command> [args...]
+
+set -e
+
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+ENVF="$XDG_RUNTIME_DIR/mecha-session.env"
+
+if [ ! -f "$ENVF" ]; then
+    echo "test session env not found at $ENVF — is the test session running?" >&2
+    exit 1
+fi
+
+# shellcheck source=/dev/null
+source "$ENVF"
+exec "$@"

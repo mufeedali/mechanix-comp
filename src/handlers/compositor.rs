@@ -37,5 +37,7 @@ impl<BackendData: Backend + 'static> CompositorHandler for State<BackendData> {
 
         self.popups.commit(surface);
         self.ensure_initial_configure(surface);
+        // Off-screen clients still need a render to get wl_surface.frame.
+        self.schedule_render();
     }
 }

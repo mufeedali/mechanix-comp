@@ -32,23 +32,6 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         let output = self.space.outputs().next()?;
         let output_geo = self.space.output_geometry(output)?;
 
-        if self.is_locked {
-            // Find if the pos is within any lock surface.
-            for lock_surface in self.lock_surfaces.iter().filter(|s| s.alive()) {
-                let surface = lock_surface.wl_surface();
-                if let Some((s, p)) = smithay::desktop::utils::under_from_surface_tree(
-                    surface,
-                    pos - output_geo.loc.to_f64(),
-                    (0, 0),
-                    WindowSurfaceType::ALL,
-                ) {
-                    return Some((s.clone(), p.to_f64() + output_geo.loc.to_f64()));
-                }
-            }
-            // If locked, don't fall through to other surfaces.
-            return None;
-        }
-
         let map = layer_map_for_output(output);
 
         let layer_surface_under = |layer: &smithay::desktop::LayerSurface| {
@@ -82,6 +65,30 @@ impl<BackendData: Backend + 'static> State<BackendData> {
                 .and_then(|layer| layer_surface_under(layer).or_else(|| layer_main_hit(layer)))
         };
 
+        if self.is_locked {
+            let privileged = map.layers().rev().find(|layer| {
+                self.is_lock_privileged_layer(layer)
+                    && (layer_surface_under(layer).is_some() || layer_main_hit(layer).is_some())
+            });
+            if let Some(layer) = privileged
+                && let Some(found) = layer_surface_under(layer).or_else(|| layer_main_hit(layer))
+            {
+                return Some(found);
+            }
+            for lock_surface in self.lock_surfaces.iter().filter(|s| s.alive()) {
+                let surface = lock_surface.wl_surface();
+                if let Some((s, p)) = smithay::desktop::utils::under_from_surface_tree(
+                    surface,
+                    pos - output_geo.loc.to_f64(),
+                    (0, 0),
+                    WindowSurfaceType::ALL,
+                ) {
+                    return Some((s.clone(), p.to_f64() + output_geo.loc.to_f64()));
+                }
+            }
+            return None;
+        }
+
         // A fullscreen window obscures Top/Bottom layers, leaving only Overlay.
         let fullscreen_active = self.active_fullscreen_window().is_some();
         let upper_kinds = if fullscreen_active {
@@ -95,8 +102,14 @@ impl<BackendData: Backend + 'static> State<BackendData> {
 
         let modal = self.active_modal_window();
         if let Some((window, location)) = self.space.element_under(pos) {
+            // Comet hides unfocused apps: skip windows outside the active group
+            // so clicks in the clear area don't reach hidden apps.
+            let active_group = self.active_group();
+            let in_group = window
+                .toplevel()
+                .is_some_and(|t| active_group.contains(t.wl_surface()));
             // A modal dialog blocks input to every other window.
-            if modal.as_ref().is_none_or(|m| m == window) {
+            if in_group && modal.as_ref().is_none_or(|m| m == window) {
                 if let Some((surface, loc)) = window
                     .surface_under(pos - location.to_f64(), WindowSurfaceType::ALL)
                     .map(|(s, p)| (s, (p + location).to_f64()))
@@ -143,6 +156,8 @@ impl<BackendData: Backend + 'static> State<BackendData> {
                     error!(cmd, err = %e, "Failed to start program");
                 }
             }
+
+            KeyAction::PowerPress | KeyAction::PowerRelease => {}
         }
     }
 
@@ -162,7 +177,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
                 state,
                 serial,
                 time,
-                |_, modifiers, handle| {
+                |data, modifiers, handle| {
                     let keysym = handle.modified_sym();
 
                     debug!(
@@ -178,7 +193,14 @@ impl<BackendData: Backend + 'static> State<BackendData> {
                     // so that we can decide on a release if the key
                     // should be forwarded to the client or not.
                     if let KeyState::Pressed = state {
-                        let action = process_keyboard_shortcut(*modifiers, keysym);
+                        let action = if is_power_key(keysym) {
+                            Some(KeyAction::PowerPress)
+                        } else if data.output_power.any_off() {
+                            // # SHELL-HELL: swallow keys while blanked; only the power key wakes.
+                            Some(KeyAction::None)
+                        } else {
+                            process_keyboard_shortcut(*modifiers, keysym)
+                        };
 
                         if action.is_some() {
                             suppressed_keys.push(keysym);
@@ -187,6 +209,9 @@ impl<BackendData: Backend + 'static> State<BackendData> {
                         action
                             .map(FilterResult::Intercept)
                             .unwrap_or(FilterResult::Forward)
+                    } else if is_power_key(keysym) {
+                        suppressed_keys.retain(|k| *k != keysym);
+                        FilterResult::Intercept(KeyAction::PowerRelease)
                     } else {
                         let suppressed = suppressed_keys.contains(&keysym);
                         if suppressed {
@@ -235,7 +260,9 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         };
 
         let serial = SERIAL_COUNTER.next_serial();
-        // self.update_keyboard_focus(touch_location, serial);
+        if !handle.is_grabbed() {
+            self.assign_pointer_click_focus(touch_location, serial);
+        }
 
         let under = self.surface_under(touch_location);
         handle.down(
@@ -307,24 +334,100 @@ impl<BackendData: Backend + 'static> State<BackendData> {
 
     fn on_device_removed<B: InputBackend>(&mut self, _device: B::Device) {}
 
+    /// Same focus policy for pointer press and touch down: OnDemand layers, else the window, else lower layers.
+    fn assign_pointer_click_focus(
+        &mut self,
+        pos: Point<f64, Logical>,
+        serial: smithay::utils::Serial,
+    ) {
+        if self.is_locked {
+            // # SHELL-HELL: do not move keyboard focus onto the OSK; gtklock's entry must keep it.
+            let on_privileged = self.space.outputs().next().is_some_and(|output| {
+                let Some(output_geo) = self.space.output_geometry(&output) else {
+                    return false;
+                };
+                let map = layer_map_for_output(&output);
+                let local = pos - output_geo.loc.to_f64();
+                map.layers().any(|layer| {
+                    if !self.is_lock_privileged_layer(layer) {
+                        return false;
+                    }
+                    let layer_loc = map.layer_geometry(layer).unwrap().loc;
+                    let at = local - layer_loc.to_f64();
+                    layer
+                        .surface_under(at, WindowSurfaceType::ALL)
+                        .is_some_and(|(surface, _)| surface != *layer.wl_surface())
+                        || layer_main_surface_hits(layer, at)
+                })
+            });
+            if !on_privileged && let Some((surface, _)) = self.surface_under(pos) {
+                self.seat
+                    .get_keyboard()
+                    .unwrap()
+                    .set_focus(self, Some(surface), serial);
+            }
+            return;
+        }
+
+        let layer_under = |kinds: [WlrLayer; 2]| {
+            self.space.outputs().next().cloned().and_then(|output| {
+                let output_geo = self.space.output_geometry(&output)?;
+                let map = layer_map_for_output(&output);
+                let pos = pos - output_geo.loc.to_f64();
+                topmost_accepting_layer(&*map, pos, kinds).map(|layer| {
+                    let on_demand = layer.cached_state().keyboard_interactivity
+                        == KeyboardInteractivity::OnDemand;
+                    (layer.wl_surface().clone(), on_demand)
+                })
+            })
+        };
+
+        let upper_kinds = if self.active_fullscreen_window().is_some() {
+            [WlrLayer::Overlay, WlrLayer::Overlay]
+        } else {
+            [WlrLayer::Overlay, WlrLayer::Top]
+        };
+        if let Some((surface, on_demand)) = layer_under(upper_kinds) {
+            if on_demand {
+                self.layer_shell_on_demand_focus = Some(surface);
+            }
+        } else if let Some(window) = self.space.element_under(pos).map(|(w, _)| w.clone()) {
+            let modal = self.active_modal_window();
+            if modal.as_ref().is_none_or(|m| m == &window) {
+                self.focus_window(&window, serial);
+            }
+        } else if self.active_fullscreen_window().is_none()
+            && let Some((surface, on_demand)) =
+                layer_under([WlrLayer::Bottom, WlrLayer::Background])
+        {
+            if on_demand {
+                self.layer_shell_on_demand_focus = Some(surface);
+            }
+        }
+    }
+
     pub fn process_input_event<I: InputBackend>(&mut self, event: InputEvent<I>) {
-        // Any input event counts as user activity: reset the idle-notify
-        // timers so `swayidle`-style clients don't go idle while the user is
-        // using the compositor. The notifier itself keeps inhibited seats
-        // (zwp-idle-inhibit-v1) from idling.
-        self.idle_notifier_state.notify_activity(&self.seat);
+        // # SHELL-HELL: power press/release is not idle activity.
         match event {
             InputEvent::Keyboard { event, .. } => match self.keyboard_key_to_action::<I>(event) {
-                // TODO Separate for different backends e.g. VtSwitch
-                action => match action {
-                    KeyAction::VtSwitch(_)
-                    | KeyAction::None
-                    | KeyAction::Quit
-                    | KeyAction::Run(_) => self.process_common_key_action(action),
-                },
+                KeyAction::PowerPress => self.begin_power_press(),
+                KeyAction::PowerRelease => self.end_power_press(),
+                action => {
+                    if !self.output_power.any_off() {
+                        self.idle_notifier_state.notify_activity(&self.seat);
+                    }
+                    self.process_common_key_action(action);
+                }
             },
-            InputEvent::PointerMotion { .. } => {}
+            InputEvent::PointerMotion { .. } => {
+                if !self.output_power.any_off() {
+                    self.idle_notifier_state.notify_activity(&self.seat);
+                }
+            }
             InputEvent::PointerMotionAbsolute { event, .. } => {
+                if !self.output_power.any_off() {
+                    self.idle_notifier_state.notify_activity(&self.seat);
+                }
                 let output = self.space.outputs().next().unwrap();
 
                 let output_geo = self.space.output_geometry(output).unwrap();
@@ -349,8 +452,18 @@ impl<BackendData: Backend + 'static> State<BackendData> {
                 pointer.frame(self);
             }
             InputEvent::PointerButton { event, .. } => {
+                if self.output_power.any_off() {
+                    return;
+                }
+                if event.state() == ButtonState::Pressed
+                    && self.dismiss_power_menu_if_outside(
+                        self.seat.get_pointer().unwrap().current_location(),
+                    )
+                {
+                    return;
+                }
+                self.idle_notifier_state.notify_activity(&self.seat);
                 let pointer = self.seat.get_pointer().unwrap();
-                let keyboard = self.seat.get_keyboard().unwrap();
 
                 let serial = SERIAL_COUNTER.next_serial();
 
@@ -359,58 +472,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
                 let button_state = event.state();
 
                 if ButtonState::Pressed == button_state && !pointer.is_grabbed() {
-                    let pos = pointer.current_location();
-                    if self.is_locked {
-                        if let Some((surface, _)) = self.surface_under(pos) {
-                            keyboard.set_focus(self, Some(surface), serial);
-                        }
-                    } else {
-                        // The click is delivered to the accepting layer via
-                        // `pointer.button`; keyboard focus is applied centrally
-                        // by `update_keyboard_focus` from the on-demand marker.
-                        // Only `OnDemand` layers set the marker; clicking an
-                        // Exclusive/None layer or empty desktop leaves focus alone.
-                        let layer_under = |kinds: [WlrLayer; 2]| {
-                            self.space.outputs().next().cloned().and_then(|output| {
-                                let output_geo = self.space.output_geometry(&output)?;
-                                let map = layer_map_for_output(&output);
-                                let pos = pos - output_geo.loc.to_f64();
-                                topmost_accepting_layer(&*map, pos, kinds).map(|layer| {
-                                    let on_demand = layer.cached_state().keyboard_interactivity
-                                        == KeyboardInteractivity::OnDemand;
-                                    (layer.wl_surface().clone(), on_demand)
-                                })
-                            })
-                        };
-
-                        // Overlay/Top layers win the click; a fullscreen window
-                        // covers everything but the Overlay layer.
-                        let upper_kinds = if self.active_fullscreen_window().is_some() {
-                            [WlrLayer::Overlay, WlrLayer::Overlay]
-                        } else {
-                            [WlrLayer::Overlay, WlrLayer::Top]
-                        };
-                        if let Some((surface, on_demand)) = layer_under(upper_kinds) {
-                            if on_demand {
-                                self.layer_shell_on_demand_focus = Some(surface);
-                            }
-                        } else if let Some(window) =
-                            self.space.element_under(pos).map(|(w, _)| w.clone())
-                        {
-                            // Modal dialogs keep the parent focused.
-                            let modal = self.active_modal_window();
-                            if modal.as_ref().is_none_or(|m| m == &window) {
-                                self.focus_window(&window, serial);
-                            }
-                        } else if self.active_fullscreen_window().is_none()
-                            && let Some((surface, on_demand)) =
-                                layer_under([WlrLayer::Bottom, WlrLayer::Background])
-                        {
-                            if on_demand {
-                                self.layer_shell_on_demand_focus = Some(surface);
-                            }
-                        }
-                    }
+                    self.assign_pointer_click_focus(pointer.current_location(), serial);
                 };
 
                 pointer.button(
@@ -425,6 +487,10 @@ impl<BackendData: Backend + 'static> State<BackendData> {
                 pointer.frame(self);
             }
             InputEvent::PointerAxis { event, .. } => {
+                if self.output_power.any_off() {
+                    return;
+                }
+                self.idle_notifier_state.notify_activity(&self.seat);
                 let source = event.source();
 
                 let horizontal_amount = event.amount(Axis::Horizontal).unwrap_or_else(|| {
@@ -463,10 +529,35 @@ impl<BackendData: Backend + 'static> State<BackendData> {
                 pointer.axis(self, frame);
                 pointer.frame(self);
             }
-            InputEvent::TouchDown { event } => self.on_touch_down::<I>(event),
-            InputEvent::TouchUp { event } => self.on_touch_up::<I>(event),
-            InputEvent::TouchMotion { event } => self.on_touch_motion::<I>(event),
-            InputEvent::TouchFrame { event } => self.on_touch_frame::<I>(event),
+            InputEvent::TouchDown { event } => {
+                if self.output_power.any_off() {
+                    return;
+                }
+                if let Some(pos) = self.touch_location_transformed(&event)
+                    && self.dismiss_power_menu_if_outside(pos)
+                {
+                    return;
+                }
+                self.idle_notifier_state.notify_activity(&self.seat);
+                self.on_touch_down::<I>(event);
+            }
+            InputEvent::TouchUp { event } => {
+                if !self.output_power.any_off() {
+                    self.idle_notifier_state.notify_activity(&self.seat);
+                    self.on_touch_up::<I>(event);
+                }
+            }
+            InputEvent::TouchMotion { event } => {
+                if !self.output_power.any_off() {
+                    self.idle_notifier_state.notify_activity(&self.seat);
+                    self.on_touch_motion::<I>(event);
+                }
+            }
+            InputEvent::TouchFrame { event } => {
+                if !self.output_power.any_off() {
+                    self.on_touch_frame::<I>(event);
+                }
+            }
             InputEvent::TouchCancel { event } => self.on_touch_cancel::<I>(event),
             InputEvent::DeviceAdded { device } => self.on_device_added::<I>(device),
             InputEvent::DeviceRemoved { device } => self.on_device_removed::<I>(device),
@@ -484,8 +575,19 @@ enum KeyAction {
     VtSwitch(i32),
     /// run a command
     Run(String),
+    /// Power key down: start the long-press timer.
+    PowerPress,
+    /// Power key up: short press toggles DPMS unless the timer already fired.
+    PowerRelease,
     /// Do nothing more
     None,
+}
+
+fn is_power_key(keysym: Keysym) -> bool {
+    matches!(
+        keysym.raw(),
+        keysyms::KEY_XF86PowerOff | keysyms::KEY_XF86PowerDown
+    )
 }
 
 fn process_keyboard_shortcut(modifiers: ModifiersState, keysym: Keysym) -> Option<KeyAction> {

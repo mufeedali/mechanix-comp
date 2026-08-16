@@ -30,3 +30,8 @@ default-features = false
 
 [dependencies]
 tracing = "0.1"
+# Direct deps backing the vendored phoc device-state protocol bindings
+# (same versions already locked via smithay).
+bitflags = "=2.13.0"
+wayland-backend = "=0.3.16"
+wayland-server = "=0.31.14"

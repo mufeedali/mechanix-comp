@@ -1,0 +1,67 @@
+# Ubuntu 24.04 (Noble) ships glibc 2.39 for amd64, which satisfies the minimum
+# required by Rust 1.85+ toolchains built on Fedora 42 / modern distros.
+# The cross-rs :main image is Ubuntu 20.04 (glibc 2.31) and causes GLIBC version
+# mismatches when running build scripts compiled by a newer host toolchain.
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Make plain `pkg-config` resolve the arm64 sysroot's .pc files (the sys-crates
+# invoke `pkg-config` by name, ignoring any PKG_CONFIG wrapper env). pkgconf
+# also ships /usr/bin/aarch64-linux-gnu-pkg-config (a personality wrapper) as a
+# symlink to itself; with PKG_CONFIG_LIBDIR set here, both paths work.
+ENV PKG_CONFIG_LIBDIR=/usr/lib/aarch64-linux-gnu/pkgconfig
+
+# Install the aarch64 cross-compilation toolchain plus native (x86_64) dev libs.
+#
+# Native libs are needed because build scripts (build.rs) are compiled for the
+# host (x86_64) inside the container. The compositor's sys-crates (gbm-sys,
+# drm-sys, udev-sys, libseat-sys, input-sys) resolve their native libraries via
+# pkg-config, so we need the aarch64 pkg-config wrapper plus the amd64 build
+# tools.
+RUN apt-get update -qq \
+ && apt-get install -y --no-install-recommends \
+        gcc \
+        libc6-dev \
+        pkg-config \
+        binutils-aarch64-linux-gnu \
+        gcc-aarch64-linux-gnu \
+        libc6-dev-arm64-cross \
+        ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+
+# Add arm64 multiarch and install the native libraries the compositor links at
+# compile time, for the aarch64 sysroot:
+#   libgbm, libdrm  (gbm/drm backends, via gbm-sys/drm-sys)
+#   libudev         (udev backend, via udev-sys)
+#   libseat         (libseat session backend, via libseat-sys)
+#   libinput        (libinput backend, via input-sys)
+# khronos-egl, libwayland and libxkbcommon are dlopen'd at runtime so they need
+# no sysroot entry here.
+#
+# Ubuntu 24.04 uses DEB822 sources format. The standard archive
+# (archive.ubuntu.com) only serves amd64/i386; arm64 packages are on
+# ports.ubuntu.com. We restrict the existing entries to amd64 and add
+# ports.ubuntu.com entries for arm64.
+RUN dpkg --add-architecture arm64 \
+ && sed -i '/^Types: deb/a Architectures: amd64' /etc/apt/sources.list.d/ubuntu.sources \
+ && printf '\nTypes: deb\nURIs: http://ports.ubuntu.com/ubuntu-ports\nSuites: noble noble-updates noble-backports\nComponents: main restricted universe multiverse\nArchitectures: arm64\nSigned-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg\n\nTypes: deb\nURIs: http://ports.ubuntu.com/ubuntu-ports\nSuites: noble-security\nComponents: main restricted universe multiverse\nArchitectures: arm64\nSigned-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg\n' \
+        >> /etc/apt/sources.list.d/ubuntu.sources \
+ && apt-get update -qq \
+ && apt-get install -y --no-install-recommends \
+        libgbm-dev:arm64 \
+        libdrm-dev:arm64 \
+        libudev-dev:arm64 \
+        libseat-dev:arm64 \
+        libinput-dev:arm64 \
+        libxkbcommon-dev:arm64 \
+ && rm -rf /var/lib/apt/lists/*
+
+# rustc 1.97+ defaults to the bundled `wild` linker and passes `-fuse-ld=wild`
+# to the compiler driver. The arm64 GCC driver doesn't know that value (it
+# knows bfd/gold/lld), so route it to the classic bfd linker by wrapping the
+# cross compiler. GCC picks the last -fuse-ld, so this also overrides the
+# `-fuse-ld=lld` rustc emits for gnu targets.
+RUN printf '#!/bin/bash\nARGS=()\nfor a in "$@"; do [ "$a" = "-fuse-ld=wild" ] && a="-fuse-ld=bfd"; ARGS+=("$a"); done\nexec /usr/bin/aarch64-linux-gnu-gcc "${ARGS[@]}"\n' \
+        > /usr/local/bin/aarch64-linux-gnu-gcc \
+ && chmod +x /usr/local/bin/aarch64-linux-gnu-gcc
