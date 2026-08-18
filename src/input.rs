@@ -4,7 +4,7 @@ use smithay::{
     backend::input::{
         AbsolutePositionEvent, Axis, AxisSource, ButtonState, Device, DeviceCapability, Event,
         InputBackend, InputEvent, KeyState, KeyboardKeyEvent, PointerAxisEvent, PointerButtonEvent,
-        TouchEvent,
+        PointerMotionEvent, TouchEvent,
     },
     desktop::{WindowSurfaceType, layer_map_for_output},
     input::{
@@ -389,7 +389,22 @@ impl<BackendData: Backend + 'static> State<BackendData> {
                     | KeyAction::Run(_) => self.process_common_key_action(action),
                 },
             },
-            InputEvent::PointerMotion { .. } => {}
+            InputEvent::PointerMotion { event } => {
+                let pointer = self.seat.get_pointer().unwrap();
+                let pos = pointer.current_location() + event.delta();
+                let serial = SERIAL_COUNTER.next_serial();
+                let under = self.surface_under(pos);
+                pointer.motion(
+                    self,
+                    under,
+                    &MotionEvent {
+                        location: pos,
+                        serial,
+                        time: event.time_msec(),
+                    },
+                );
+                pointer.frame(self);
+            }
             InputEvent::PointerMotionAbsolute { event, .. } => {
                 let output = self.space.outputs().next().unwrap();
 
