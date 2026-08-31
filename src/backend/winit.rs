@@ -1,6 +1,5 @@
 use std::sync::Mutex;
 
-use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::ImportDma;
 use smithay::backend::renderer::damage::OutputDamageTracker;
 use smithay::backend::renderer::element::AsRenderElements;
@@ -16,11 +15,12 @@ use smithay::input::pointer::{CursorImageAttributes, CursorImageStatus};
 use smithay::output::{Mode, Output, PhysicalProperties, Scale, Subpixel};
 use smithay::reexports::calloop::EventLoop;
 use smithay::reexports::wayland_server::Display;
+use smithay::reexports::wayland_server::Resource;
 use smithay::utils::{IsAlive, Rectangle, Transform};
 use smithay::wayland::compositor::with_states;
 
 use crate::backend::Backend;
-use crate::drawing::PointerElement;
+use crate::drawing::{PointerElement, cached_pointer_buffer};
 use crate::render::{Element, OutputElements, output_elements};
 use crate::state::State;
 
@@ -48,6 +48,10 @@ impl Backend for WinitData {
     fn reset_buffers(&mut self, _output: &Output) {
         // The winit backend re-renders a full frame every time; there are no
         // scanout buffers to reset.
+    }
+
+    fn schedule_render(&mut self, _output: &Output) {
+        self.backend.window().request_redraw();
     }
 
     fn touch_transform(&self, _output: &Output) -> Transform {
@@ -160,22 +164,13 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 let size = state.backend_data.backend.window_size();
                 let damage = Rectangle::from_size(size);
 
-                // Reset to the default named shape if the client-provided
-                // cursor surface went away, then mirror the status into the
-                // pointer element.
-                {
-                    let mut reset = false;
-                    if let CursorImageStatus::Surface(ref surface) = state.cursor_status {
-                        reset = !surface.alive();
-                    }
-                    if reset {
-                        state.cursor_status = CursorImageStatus::default_named();
-                    }
-                    state
-                        .backend_data
-                        .pointer_element
-                        .set_status(state.cursor_status.clone());
+                if matches!(&state.cursor_status, CursorImageStatus::Surface(s) if !s.is_alive()) {
+                    state.cursor_status = CursorImageStatus::default_named();
                 }
+                state
+                    .backend_data
+                    .pointer_element
+                    .set_status(state.cursor_status.clone());
 
                 let visible = state.visible_surfaces(&output);
                 let result = {
@@ -209,28 +204,11 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                         .backend_data
                         .pointer_image
                         .get_image(cursor_scale, state.clock.now().into());
-                    let pointer_images = &mut state.backend_data.pointer_images;
-                    let pointer_image = pointer_images
-                        .iter()
-                        .find_map(|(image, texture)| {
-                            if image == &frame {
-                                Some(texture.clone())
-                            } else {
-                                None
-                            }
-                        })
-                        .unwrap_or_else(|| {
-                            let buffer = MemoryRenderBuffer::from_slice(
-                                &frame.pixels_rgba,
-                                Fourcc::Argb8888,
-                                (frame.width as i32, frame.height as i32),
-                                cursor_scale as i32,
-                                Transform::Normal,
-                                None,
-                            );
-                            pointer_images.push((frame, buffer.clone()));
-                            buffer
-                        });
+                    let pointer_image = cached_pointer_buffer(
+                        &mut state.backend_data.pointer_images,
+                        frame,
+                        cursor_scale as i32,
+                    );
                     state.backend_data.pointer_element.set_buffer(pointer_image);
 
                     // Queue the cursor above everything else.
@@ -291,8 +269,6 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 state.backend_data.backend.submit(Some(&[damage])).unwrap();
 
                 state.send_frame_callbacks(&output);
-
-                state.backend_data.backend.window().request_redraw();
             }
             WinitEvent::CloseRequested => {
                 state.loop_signal.stop();

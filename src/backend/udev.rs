@@ -1,7 +1,6 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Mutex;
-use std::time::Duration;
 
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::allocator::gbm::{GbmAllocator, GbmBufferFlags, GbmDevice};
@@ -11,23 +10,21 @@ use smithay::backend::drm::output::{DrmOutput, DrmOutputManager, DrmOutputRender
 use smithay::backend::drm::{
     DrmDevice, DrmDeviceFd, DrmEvent, DrmEventMetadata, DrmNode, NodeType,
 };
-use smithay::backend::egl::{EGLContext, EGLDevice, EGLDisplay};
+use smithay::backend::egl::{EGLContext, EGLDisplay};
 use smithay::backend::input::InputEvent;
 use smithay::backend::libinput::{LibinputInputBackend, LibinputSessionInterface};
 use smithay::backend::renderer::ImportDma;
-use smithay::backend::renderer::element::AsRenderElements;
-use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::element::memory::MemoryRenderBuffer;
 use smithay::backend::renderer::element::surface::{
     WaylandSurfaceRenderElement, render_elements_from_surface_tree,
 };
+use smithay::backend::renderer::element::{AsRenderElements, Kind};
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::backend::session::libseat::LibSeatSession;
 use smithay::backend::session::{Event as SessionEvent, Session};
 use smithay::backend::udev::{UdevBackend, UdevEvent, primary_gpu};
 use smithay::input::pointer::{CursorImageAttributes, CursorImageStatus};
 use smithay::output::{Mode as WlMode, Output, PhysicalProperties, Scale};
-use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
 use smithay::reexports::calloop::{EventLoop, LoopHandle, RegistrationToken};
 use smithay::reexports::drm::control::{ModeTypeFlags, connector, crtc};
 use smithay::reexports::input::AccelProfile;
@@ -36,13 +33,13 @@ use smithay::reexports::rustix::fs::OFlags;
 use smithay::reexports::wayland_server::Display;
 use smithay::reexports::wayland_server::Resource;
 use smithay::reexports::wayland_server::backend::GlobalId;
-use smithay::utils::{DeviceFd, IsAlive, Transform};
+use smithay::utils::{DeviceFd, IsAlive};
 use smithay::wayland::compositor::with_states;
 use smithay_drm_extras::drm_scanner::{DrmScanEvent, DrmScanner};
 use tracing::{error, info, warn};
 
 use crate::backend::Backend;
-use crate::drawing::PointerElement;
+use crate::drawing::{PointerElement, cached_pointer_buffer};
 use crate::render::{Element, OutputElements, output_elements};
 use crate::state::State;
 
@@ -67,6 +64,16 @@ type GbmDrmOutputManager = DrmOutputManager<
 struct UdevOutputId {
     device_id: DrmNode,
     crtc: crtc::Handle,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum CrtcState {
+    #[default]
+    Idle,
+    RenderScheduled,
+    WaitingForVBlank {
+        damage_pending: bool,
+    },
 }
 
 /// Per-CRTC scanout state.
@@ -102,8 +109,8 @@ pub struct UdevData {
     /// Cache of imported cursor frames, keyed by the raw xcursor image.
     pointer_images: Vec<(xcursor::parser::Image, MemoryRenderBuffer)>,
     pointer_element: PointerElement,
-    /// CRTCs with a render already queued, so `schedule_render` on them is a no-op.
-    pending_render: HashSet<(DrmNode, crtc::Handle)>,
+    /// Per-CRTC scheduling state for `schedule_render`.
+    crtc_states: HashMap<(DrmNode, crtc::Handle), CrtcState>,
 }
 
 impl Backend for UdevData {
@@ -141,24 +148,23 @@ impl Backend for UdevData {
         let Some(id) = output.user_data().get::<UdevOutputId>().copied() else {
             return false;
         };
-        let Some(device) = self.devices.get_mut(&id.device_id) else {
-            return false;
-        };
-        let Some(surface) = device.surfaces.get_mut(&id.crtc) else {
+        let Some(surface) = self
+            .devices
+            .get_mut(&id.device_id)
+            .and_then(|d| d.surfaces.get_mut(&id.crtc))
+        else {
             return false;
         };
         if on {
-            // clear() left the CRTC inactive; the next queue_frame must modeset.
+            // DPMS-off's clear() already nulled pending_frame, so reset_buffers alone is safe.
             surface.drm_output.reset_buffers();
-            return true;
+        } else if let Err(err) = surface.drm_output.with_compositor(|c| c.clear()) {
+            warn!("DPMS off failed on {}: {err}", output.name());
+            return false;
         }
-        match surface.drm_output.with_compositor(|c| c.clear()) {
-            Ok(()) => true,
-            Err(err) => {
-                warn!("DPMS off failed on {}: {err}", output.name());
-                false
-            }
-        }
+        // The cancelled flip will never vblank, so drop the wait state.
+        self.set_crtc_idle((id.device_id, id.crtc));
+        true
     }
 
     fn prepare_resume(&mut self) {
@@ -167,22 +173,40 @@ impl Backend for UdevData {
                 warn!("Failed to activate DRM device {node} after resume: {err}");
             }
         }
+        self.abandon_all_pageflips();
     }
 
     fn schedule_render(&mut self, output: &Output) {
         let Some(id) = output.user_data().get::<UdevOutputId>().copied() else {
             return;
         };
-        if !self.pending_render.insert((id.device_id, id.crtc)) {
-            return;
+        let key = (id.device_id, id.crtc);
+        let state = self.crtc_states.entry(key).or_default();
+        match state {
+            CrtcState::Idle => {
+                *state = CrtcState::RenderScheduled;
+                self.loop_handle.insert_idle(move |state| {
+                    state.render_surface(id.device_id, id.crtc);
+                });
+            }
+            CrtcState::WaitingForVBlank { damage_pending } => {
+                *damage_pending = true;
+            }
+            CrtcState::RenderScheduled => {}
         }
-        self.loop_handle.insert_idle(move |state| {
-            state
-                .backend_data
-                .pending_render
-                .remove(&(id.device_id, id.crtc));
-            state.render_surface(id.device_id, id.crtc);
-        });
+    }
+}
+
+impl UdevData {
+    /// A cancelled flip never vblanks; reset so the next `schedule_render` queues one.
+    fn set_crtc_idle(&mut self, key: (DrmNode, crtc::Handle)) {
+        self.crtc_states.insert(key, CrtcState::Idle);
+    }
+
+    fn abandon_all_pageflips(&mut self) {
+        for state in self.crtc_states.values_mut() {
+            *state = CrtcState::Idle;
+        }
     }
 }
 
@@ -207,7 +231,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             if candidate.exists() { candidate } else { p }
         }
     } else {
-        primary_gpu(&session.seat())?.ok_or("no GPU found for seat")?
+        primary_gpu(session.seat())?.ok_or("no GPU found for seat")?
     };
     let primary_node = DrmNode::from_path(&primary_path)?;
     let primary_gpu = primary_node
@@ -229,7 +253,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         pointer_image: crate::cursor::Cursor::load(),
         pointer_images: Vec::new(),
         pointer_element: PointerElement::default(),
-        pending_render: HashSet::new(),
+        crtc_states: HashMap::new(),
     };
 
     let mut state = State::new(&mut event_loop, display, udev_data);
@@ -318,6 +342,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 for device in state.backend_data.devices.values_mut() {
                     device.drm_output_manager.pause();
                 }
+                state.backend_data.abandon_all_pageflips();
             }
             SessionEvent::ActivateSession => {
                 info!("session resumed");
@@ -334,10 +359,9 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 if device_id == primary_dev_id
                     && let Ok(node) = DrmNode::from_dev_id(device_id)
                     && !state.backend_data.devices.contains_key(&node)
+                    && let Err(err) = state.device_added(node, &path)
                 {
-                    if let Err(err) = state.device_added(node, &path) {
-                        error!("Failed to add device {device_id}: {err}");
-                    }
+                    error!("Failed to add device {device_id}: {err}");
                 }
             }
             UdevEvent::Changed { device_id } => {
@@ -417,14 +441,8 @@ impl State<UdevData> {
         if self.dmabuf_global.is_none() {
             let dmabuf_formats = renderer.dmabuf_formats();
 
-            // Ask EGL which render node it is actually using. This handles kmsro
-            // transparently: even though `node` is a display-only controller (imx-lcdif),
-            // EGL internally uses the paired etnaviv render node.
-            let render_node = EGLDevice::device_for_display(&egl_display)
-                .ok()
-                .and_then(|dev| dev.try_get_render_node().ok().flatten())
-                // Final fallback: use the card node's own render peer (works on
-                // real GPU cards like etnaviv card0 that do have a render node).
+            let render_node = super::egl_render_node(&egl_display)
+                // Fallback for real GPU cards whose card node has a render peer.
                 .or_else(|| node.node_with_type(NodeType::Render).and_then(|r| r.ok()));
 
             let main_device_id = render_node
@@ -603,12 +621,11 @@ impl State<UdevData> {
         );
 
         // Kick off the first render.
-        self.backend_data.loop_handle.insert_idle(move |state| {
-            state.render_surface(node, crtc);
-        });
+        self.backend_data.schedule_render(&output);
     }
 
     fn connector_disconnected(&mut self, node: DrmNode, crtc: crtc::Handle) {
+        self.backend_data.crtc_states.remove(&(node, crtc));
         let Some(device) = self.backend_data.devices.get_mut(&node) else {
             return;
         };
@@ -631,6 +648,7 @@ impl State<UdevData> {
             .cloned();
         if let Some(output) = output {
             self.output_power.output_removed(&output);
+            self.layouts.remove(&output);
             self.space.unmap_output(&output);
         }
     }
@@ -652,11 +670,14 @@ impl State<UdevData> {
 
     /// Render one CRTC: queue a pageflip on damage, deliver frame callbacks otherwise.
     fn render_surface(&mut self, node: DrmNode, crtc: crtc::Handle) {
+        let key = (node, crtc);
         let Some(output) = self.output_for_crtc(node, crtc) else {
+            self.backend_data.set_crtc_idle(key);
             return;
         };
 
         if self.output_power.is_off(&output) {
+            self.backend_data.set_crtc_idle(key);
             return;
         }
 
@@ -665,12 +686,16 @@ impl State<UdevData> {
         let mut queued = false;
         {
             let Some(renderer) = self.backend_data.renderer.as_mut() else {
+                self.backend_data.set_crtc_idle(key);
                 return;
             };
-            let Some(device) = self.backend_data.devices.get_mut(&node) else {
-                return;
-            };
-            let Some(surface) = device.surfaces.get_mut(&crtc) else {
+            let Some(surface) = self
+                .backend_data
+                .devices
+                .get_mut(&node)
+                .and_then(|d| d.surfaces.get_mut(&crtc))
+            else {
+                self.backend_data.set_crtc_idle(key);
                 return;
             };
 
@@ -715,45 +740,19 @@ impl State<UdevData> {
                         .backend_data
                         .pointer_image
                         .get_image(cursor_scale, self.clock.now().into());
-                    let pointer_images = &mut self.backend_data.pointer_images;
-                    let pointer_image = pointer_images
-                        .iter()
-                        .find_map(|(image, texture)| {
-                            if image == &frame {
-                                Some(texture.clone())
-                            } else {
-                                None
-                            }
-                        })
-                        .unwrap_or_else(|| {
-                            let buffer = MemoryRenderBuffer::from_slice(
-                                &frame.pixels_rgba,
-                                Fourcc::Argb8888,
-                                (frame.width as i32, frame.height as i32),
-                                cursor_scale as i32,
-                                Transform::Normal,
-                                None,
-                            );
-                            pointer_images.push((frame, buffer.clone()));
-                            buffer
-                        });
-
+                    let pointer_image = cached_pointer_buffer(
+                        &mut self.backend_data.pointer_images,
+                        frame,
+                        cursor_scale as i32,
+                    );
                     self.backend_data.pointer_element.set_buffer(pointer_image);
-
-                    // Reset to the default named shape if the
-                    // client-provided cursor surface went away.
+                    if matches!(&self.cursor_status, CursorImageStatus::Surface(s) if !s.is_alive())
                     {
-                        let mut reset = false;
-                        if let CursorImageStatus::Surface(ref surface) = self.cursor_status {
-                            reset = !surface.is_alive();
-                        }
-                        if reset {
-                            self.cursor_status = CursorImageStatus::default_named();
-                        }
-                        self.backend_data
-                            .pointer_element
-                            .set_status(self.cursor_status.clone());
+                        self.cursor_status = CursorImageStatus::default_named();
                     }
+                    self.backend_data
+                        .pointer_element
+                        .set_status(self.cursor_status.clone());
 
                     custom_elements.extend(
                         self.backend_data.pointer_element.render_elements(
@@ -803,43 +802,38 @@ impl State<UdevData> {
                 )
             };
 
-            let result = match surface.drm_output.render_frame(
+            match surface.drm_output.render_frame(
                 renderer,
                 &elements,
                 clear_color,
                 FrameFlags::DEFAULT,
             ) {
-                Ok(result) if !result.is_empty => Some(result.states),
-                Ok(_) => None,
-                Err(err) => {
-                    warn!("Rendering failed: {err}");
-                    None
-                }
-            };
-
-            if let Some(states) = result {
-                match surface.drm_output.queue_frame(()) {
+                Ok(result) if !result.is_empty => match surface.drm_output.queue_frame(()) {
                     Ok(()) => {
                         queued = true;
-                        self.update_surface_scanout(&output, &states);
+                        self.update_surface_scanout(&output, &result.states);
                     }
-                    Err(err) => {
-                        warn!("Failed to queue frame: {err}");
-                    }
-                }
+                    Err(err) => warn!("Failed to queue frame: {err}"),
+                },
+                Ok(_) => {}
+                Err(err) => warn!("Rendering failed: {err}"),
             }
         }
 
-        if !queued {
-            // No pageflip; still deliver frame callbacks for the commit that woke us.
+        if queued {
+            self.backend_data.crtc_states.insert(
+                key,
+                CrtcState::WaitingForVBlank {
+                    damage_pending: false,
+                },
+            );
+        } else {
+            self.backend_data.set_crtc_idle(key);
             self.send_frame_callbacks(&output);
-            // Keep repainting so surface removals get re-rendered.
-            self.schedule_repaint(&output);
         }
     }
 
-    /// Vblank handler: the queued frame scanned out. Retire it, notify clients,
-    /// and schedule the next repaint.
+    /// Vblank: retire the frame, notify clients, and re-render if damage landed mid-scanout.
     fn frame_finish(
         &mut self,
         node: DrmNode,
@@ -858,45 +852,22 @@ impl State<UdevData> {
             }
         }
 
+        let prev_state = self
+            .backend_data
+            .crtc_states
+            .insert((node, crtc), CrtcState::Idle)
+            .unwrap_or_default();
+
         if let Some(output) = self.output_for_crtc(node, crtc) {
             self.send_frame_callbacks(&output);
-            self.schedule_repaint(&output);
-        }
-    }
-
-    /// Schedule the next repaint after a short delay: frame-callback-driven
-    /// clients repaint during it, and late changes (e.g. surface removal) are
-    /// picked up instead of leaving a stale frame on the CRTC.
-    fn schedule_repaint(&mut self, output: &Output) {
-        let Some(id) = output.user_data().get::<UdevOutputId>().copied() else {
-            return;
-        };
-        if !self
-            .backend_data
-            .pending_render
-            .insert((id.device_id, id.crtc))
-        {
-            return;
-        }
-        let frame_duration = output
-            .current_mode()
-            .map(|mode| Duration::from_secs_f64(1_000f64 / mode.refresh as f64))
-            .unwrap_or(Duration::from_millis(16));
-        let repaint_delay = Duration::from_secs_f64(frame_duration.as_secs_f64() * 0.6);
-        if self
-            .backend_data
-            .loop_handle
-            .insert_source(Timer::from_duration(repaint_delay), move |_, _, state| {
-                state
-                    .backend_data
-                    .pending_render
-                    .remove(&(id.device_id, id.crtc));
-                state.render_surface(id.device_id, id.crtc);
-                TimeoutAction::Drop
-            })
-            .is_err()
-        {
-            warn!("failed to schedule repaint");
+            if matches!(
+                prev_state,
+                CrtcState::WaitingForVBlank {
+                    damage_pending: true
+                }
+            ) {
+                self.backend_data.schedule_render(&output);
+            }
         }
     }
 

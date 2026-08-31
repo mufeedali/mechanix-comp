@@ -8,6 +8,13 @@ mod render;
 mod state;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    tracing_subscriber::fmt()
+        .compact()
+        .with_env_filter(filter)
+        .init();
+
     // Backend selection: an explicit `MECHA_BACKEND` wins; otherwise we assume
     // we're nested (winit) when a parent display server is present, and drive
     // KMS/DRM directly (udev) when running from a bare VT.

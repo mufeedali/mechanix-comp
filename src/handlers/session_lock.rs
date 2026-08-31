@@ -26,9 +26,12 @@ impl<BackendData: Backend + 'static> SessionLockHandler for State<BackendData> {
         // a locked frame to the screen (protocol requirement: the locked event
         // must not be sent before a cleared / lock-surface frame is visible).
         self.pending_lock = Some(confirmation);
+        self.schedule_render();
     }
 
     fn unlock(&mut self) {
+        // Drop a pending lock confirmation so it can't fire after unlock.
+        self.pending_lock.take();
         self.is_locked = false;
         self.lock_surfaces.clear();
         self.focus_topmost();

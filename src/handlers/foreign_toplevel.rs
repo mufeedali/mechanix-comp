@@ -364,8 +364,10 @@ fn state_for_version(states: &[u8], version: u32) -> Vec<u8> {
     }
     let fullscreen = (zwlr_foreign_toplevel_handle_v1::State::Fullscreen as u32).to_ne_bytes();
     states
-        .chunks_exact(4)
-        .filter(|chunk| *chunk != fullscreen)
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .filter(|chunk| **chunk != fullscreen)
         .flatten()
         .copied()
         .collect()

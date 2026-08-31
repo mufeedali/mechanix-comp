@@ -26,6 +26,7 @@ impl<BackendData: Backend + 'static> SeatHandler for State<BackendData> {
 
     fn cursor_image(&mut self, _seat: &Seat<Self>, image: CursorImageStatus) {
         self.cursor_status = image;
+        self.schedule_render();
     }
 
     fn focus_changed(&mut self, seat: &Seat<Self>, focused: Option<&WlSurface>) {
