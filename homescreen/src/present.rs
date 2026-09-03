@@ -1,7 +1,6 @@
 //! Host surface is a mecha-wayland window-manager layer. Smithay draws nest
-//! tiles into an offscreen texture, we blit that under the WM UI, then attach.
+//! tiles into the host slot's color texture (same BO as chrome), then attach.
 
-use std::num::NonZeroU32;
 use std::os::fd::AsRawFd;
 use std::time::Duration;
 
@@ -13,15 +12,14 @@ use glow::HasContext;
 use io_ring::{IoEvent, IoToken, Ring, RingSettings};
 use io_uring::{opcode, types};
 use renderer::commands::DrawQuad;
-use renderer::{DmaBuf, RenderableSurface, Renderer};
-use smithay::backend::allocator::Fourcc;
+use renderer::Renderer;
 use smithay::backend::egl::EGLContext;
 use smithay::backend::input::ButtonState;
 use smithay::backend::renderer::damage::OutputDamageTracker;
 use smithay::backend::renderer::element::AsRenderElements;
 use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
 use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
-use smithay::backend::renderer::{Bind, ImportDma, Offscreen, Texture};
+use smithay::backend::renderer::{Bind, ImportDma};
 use smithay::desktop::layer_map_for_output;
 use smithay::input::pointer::MotionEvent;
 use smithay::output::{Mode, Output, PhysicalProperties, Scale, Subpixel};
@@ -52,7 +50,10 @@ pub struct LayerData {
     damage_tracker: Option<OutputDamageTracker>,
     pending_render: bool,
     home: Home,
-    offscreen: Option<GlesTexture>,
+    /// Wraps the host slot color texture. `GlesTexture::from_raw` takes GL
+    /// ownership, so we `forget` it when the slot is replaced; `DmaBuf::destroy`
+    /// deletes the real tex.
+    slot_tex: Option<GlesTexture>,
 }
 
 impl Backend for LayerData {
@@ -112,48 +113,6 @@ fn nest_gl_from_current() -> Result<GlesRenderer, Box<dyn std::error::Error>> {
     let renderer = unsafe { GlesRenderer::new(smithay_ctx)? };
     info!("Smithay GLES renderer sharing mecha-wayland EGL context");
     Ok(renderer)
-}
-
-fn blit_from_texture(renderer: &Renderer, dst: &RenderableSurface<DmaBuf>, tex_id: u32) -> bool {
-    let Some(tex) = NonZeroU32::new(tex_id).map(glow::NativeTexture) else {
-        return false;
-    };
-    let gl = &renderer.gl;
-    unsafe {
-        let Ok(src) = gl.create_framebuffer() else {
-            return false;
-        };
-        gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(src));
-        gl.framebuffer_texture_2d(
-            glow::READ_FRAMEBUFFER,
-            glow::COLOR_ATTACHMENT0,
-            glow::TEXTURE_2D,
-            Some(tex),
-            0,
-        );
-        let ok = gl.check_framebuffer_status(glow::READ_FRAMEBUFFER) == glow::FRAMEBUFFER_COMPLETE;
-        if ok {
-            gl.disable(glow::SCISSOR_TEST);
-            gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, Some(dst.fbo));
-            gl.blit_framebuffer(
-                0,
-                0,
-                dst.width as i32,
-                dst.height as i32,
-                0,
-                0,
-                dst.width as i32,
-                dst.height as i32,
-                glow::COLOR_BUFFER_BIT,
-                glow::NEAREST,
-            );
-            gl.clear_depth_f32(0.0);
-            gl.clear(glow::DEPTH_BUFFER_BIT);
-        }
-        gl.bind_framebuffer(glow::FRAMEBUFFER, Some(dst.fbo));
-        gl.delete_framebuffer(src);
-        ok
-    }
 }
 
 fn queue_fills(renderer: &mut Renderer, fills: &[Fill]) {
@@ -246,9 +205,13 @@ impl Homescreen {
             let sqe = opcode::PollAdd::new(types::Fd(fd), libc::POLLIN as _).build();
             self.nest_token = Some(self.ring.proxy().push(sqe));
         }
-        if self.nest.state.backend_data.home.wants_tick() && self.tick_id.is_none() {
+    }
+
+    fn apply(&mut self, action: HomeAction) {
+        apply_home_action(&mut self.nest.state, action);
+        if let Some(wait) = self.nest.state.backend_data.home.take_wait() {
             self.tick_id = Some(self.timer.start_timer(Relative {
-                duration: Duration::from_millis(16),
+                duration: wait,
                 repeat: false,
             }));
         }
@@ -319,7 +282,7 @@ impl Homescreen {
                 _ => return,
             }
         };
-        apply_home_action(&mut self.nest.state, action);
+        self.apply(action);
     }
 
     fn on_touch(&mut self, ev: &WlTouchEvent) {
@@ -334,13 +297,13 @@ impl Homescreen {
                 _ => return,
             }
         };
-        apply_home_action(&mut self.nest.state, action);
+        self.apply(action);
     }
 
     fn pre_poll(&mut self) {
         self.pump_nest();
         let action = self.nest.state.backend_data.home.tick();
-        apply_home_action(&mut self.nest.state, action);
+        self.apply(action);
         if self.nest.state.backend_data.pending_render
             && let Err(err) = self.present()
         {
@@ -402,36 +365,51 @@ impl Homescreen {
 
         let fills = self.nest.state.backend_data.home.fills();
         let elements = nest_elements(&mut self.nest.state, &output);
-
         let size = (mode.size.w, mode.size.h);
-        {
-            let backend = &mut self.nest.state.backend_data;
-            if backend.offscreen.as_ref().is_none_or(|tex| tex.size() != size.into()) {
-                backend.offscreen = Some(backend.nest_gl.create_buffer(Fourcc::Argb8888, size.into())?);
-            }
-        }
-
-        let (render_states, tex_id) = {
-            let backend = &mut self.nest.state.backend_data;
-            let tex = backend.offscreen.as_mut().ok_or("offscreen missing")?;
-            let tex_id = tex.tex_id();
-            let tracker = backend
-                .damage_tracker
-                .as_mut()
-                .ok_or("damage tracker missing")?;
-            let renderer = &mut backend.nest_gl;
-            let mut fb = renderer.bind(tex)?;
-            let result = tracker.render_output(renderer, &mut fb, 0, &elements, CLEAR)?;
-            (result.states, tex_id)
-        };
-
         let layer = self.layer;
-        if self
-            .wm
+        let mut render_states = None;
+
+        let Homescreen { wm, nest, .. } = self;
+        if wm
             .render_frame(layer, true, |renderer, slot| {
-                if !blit_from_texture(renderer, slot, tex_id) {
-                    tracing::warn!("blit from nest offscreen failed");
+                let gl_id = slot.backend.color_tex_id();
+                let backend = &mut nest.state.backend_data;
+                if backend.slot_tex.as_ref().is_none_or(|t| t.tex_id() != gl_id) {
+                    if let Some(old) = backend.slot_tex.take() {
+                        std::mem::forget(old);
+                    }
+                    backend.slot_tex = Some(unsafe {
+                        GlesTexture::from_raw(
+                            &backend.nest_gl,
+                            Some(glow::RGBA8),
+                            false,
+                            gl_id,
+                            size.into(),
+                        )
+                    });
                 }
+                let Some(tex) = backend.slot_tex.as_mut() else {
+                    return;
+                };
+                let Some(tracker) = backend.damage_tracker.as_mut() else {
+                    return;
+                };
+                match backend.nest_gl.bind(tex) {
+                    Ok(mut fb) => match tracker.render_output(
+                        &mut backend.nest_gl,
+                        &mut fb,
+                        0,
+                        &elements,
+                        CLEAR,
+                    ) {
+                        Ok(res) => render_states = Some(res.states),
+                        Err(err) => tracing::error!(%err, "nest render failed"),
+                    },
+                    Err(err) => tracing::error!(%err, "bind host slot texture failed"),
+                }
+                let _ = renderer.make_current();
+                renderer.active_surface(slot);
+                unsafe { renderer.gl.flush() };
                 queue_fills(renderer, &fills);
             })
             .is_none()
@@ -439,11 +417,11 @@ impl Homescreen {
             return Ok(());
         }
 
-        self.nest
-            .state
-            .update_surface_scanout(&output, &render_states);
-        self.nest.state.send_frame_callbacks(&output);
-        self.nest.state.backend_data.pending_render = false;
+        if let Some(states) = render_states {
+            nest.state.update_surface_scanout(&output, &states);
+            nest.state.send_frame_callbacks(&output);
+            nest.state.backend_data.pending_render = false;
+        }
         Ok(())
     }
 }
@@ -460,7 +438,7 @@ impl Nest {
                 damage_tracker: None,
                 pending_render: false,
                 home: Home::load()?,
-                offscreen: None,
+                slot_tex: None,
             },
             SocketName::Widget,
         );

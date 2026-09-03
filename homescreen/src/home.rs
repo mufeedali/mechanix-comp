@@ -146,6 +146,7 @@ pub struct Home {
     /// Pixel frame during resize. Follows the handle; snaps to the grid on release.
     frame_preview: Option<Rectangle<i32, Logical>>,
     page_edge: Option<(i32, Instant)>,
+    wait: Option<Duration>,
 }
 
 impl Home {
@@ -210,6 +211,7 @@ impl Home {
             lift_loc: Point::from((0, 0)),
             frame_preview: None,
             page_edge: None,
+            wait: None,
         })
     }
 
@@ -448,6 +450,9 @@ impl Home {
             t0: Instant::now(),
             item,
         };
+        if item.is_some() {
+            self.wait = Some(LONG_PRESS);
+        }
         HomeAction::None
     }
 
@@ -594,16 +599,8 @@ impl Home {
         self.tick_settle()
     }
 
-    pub fn wants_tick(&self) -> bool {
-        self.settle.is_some()
-            || matches!(
-                self.gesture,
-                Gesture::Pending {
-                    item: Some(_),
-                    ..
-                }
-            )
-            || (self.lifted().is_some() && self.page_edge.is_some())
+    pub fn take_wait(&mut self) -> Option<Duration> {
+        self.wait.take()
     }
 
     fn tick_long_press(&mut self) -> HomeAction {
@@ -775,11 +772,13 @@ impl Home {
                     return None;
                 }
                 self.page_edge = Some((dir, now));
+                self.wait = Some(PAGE_EDGE_HOLD);
                 Some(next as u32)
             }
             Some((prev, _)) if prev == dir => None,
             _ => {
                 self.page_edge = Some((dir, now));
+                self.wait = Some(PAGE_EDGE_HOLD);
                 None
             }
         }
@@ -1372,6 +1371,7 @@ mod tests {
             lift_loc: Point::from((0, 0)),
             frame_preview: None,
             page_edge: None,
+            wait: None,
         }
     }
 
