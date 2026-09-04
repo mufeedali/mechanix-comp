@@ -126,6 +126,8 @@ pub enum HomeAction {
     TapWidget(Point<f64, Logical>),
     Launch(String),
     CloseSurface(WlSurface),
+    /// Config changed: close leftover nest surfaces, then relayout.
+    Reload { close: Vec<WlSurface> },
 }
 
 pub struct Home {
@@ -254,11 +256,25 @@ impl Home {
 
     pub fn reap(&mut self) {
         for item in &mut self.items {
-            if let Kind::Widget { child, .. } = &mut item.kind
-                && let Some(proc) = child.as_mut()
-                && proc.try_wait().ok().flatten().is_some()
-            {
-                *child = None;
+            let Kind::Widget {
+                child,
+                surface,
+                launch_failed,
+                ..
+            } = &mut item.kind
+            else {
+                continue;
+            };
+            let Some(proc) = child.as_mut() else {
+                continue;
+            };
+            let Some(status) = proc.try_wait().ok().flatten() else {
+                continue;
+            };
+            *child = None;
+            if surface.is_none() {
+                *launch_failed = true;
+                warn!(?status, "widget exited before creating a surface");
             }
         }
     }
@@ -914,6 +930,27 @@ impl Home {
     }
 
     pub fn persist(&self) {
+        if let Err(err) = config::save(&self.path, &self.current_config()) {
+            warn!(%err, "failed to write homescreen config");
+        }
+    }
+
+    pub fn reload(&mut self) -> HomeAction {
+        let cfg = match config::load(&self.path) {
+            Ok(cfg) => cfg,
+            Err(err) => {
+                warn!(%err, "homescreen config reload failed");
+                return HomeAction::None;
+            }
+        };
+        if self.current_config() == cfg {
+            return HomeAction::None;
+        }
+        info!("reloaded homescreen config");
+        self.apply_config(cfg)
+    }
+
+    fn current_config(&self) -> HomeConfig {
         let mut slots = Vec::new();
         let mut icons = Vec::new();
         for item in &self.items {
@@ -934,15 +971,113 @@ impl Home {
                 }),
             }
         }
-        let cfg = HomeConfig {
+        HomeConfig {
             columns: self.columns,
             rows: self.rows,
             slots,
             icons,
-        };
-        if let Err(err) = config::save(&self.path, &cfg) {
-            warn!(%err, "failed to write homescreen config");
         }
+    }
+
+    fn apply_config(&mut self, cfg: HomeConfig) -> HomeAction {
+        let old = std::mem::take(&mut self.items);
+        let mut old_widgets = Vec::new();
+        let mut old_icons = Vec::new();
+        for item in old {
+            if item.is_widget() {
+                old_widgets.push(item);
+            } else {
+                old_icons.push(item);
+            }
+        }
+        let mut next_id = old_widgets
+            .iter()
+            .chain(&old_icons)
+            .map(|i| i.id.0)
+            .max()
+            .unwrap_or(0)
+            + 1;
+
+        let mut items = Vec::new();
+        for slot in &cfg.slots {
+            let cells = cells_of_slot(slot);
+            if let Some(idx) = take_widget(&old_widgets, slot) {
+                let mut item = old_widgets.remove(idx);
+                item.cells = cells;
+                items.push(item);
+            } else {
+                items.push(Item {
+                    id: ItemId(next_id),
+                    cells,
+                    kind: Kind::Widget {
+                        command: slot.command.clone(),
+                        surface: None,
+                        child: None,
+                        launch_failed: false,
+                    },
+                });
+                next_id += 1;
+            }
+        }
+
+        let mut close = Vec::new();
+        for item in old_widgets {
+            if let Kind::Widget {
+                mut child, surface, ..
+            } = item.kind
+            {
+                if let Some(mut proc) = child.take() {
+                    let _ = proc.kill();
+                }
+                if let Some(surface) = surface {
+                    close.push(surface);
+                }
+            }
+        }
+
+        for (i, icon) in cfg.icons.iter().enumerate() {
+            let cells = cells_of_icon(icon);
+            if let Some(idx) = take_icon(&old_icons, icon) {
+                let mut item = old_icons.remove(idx);
+                item.cells = cells;
+                items.push(item);
+            } else {
+                let hue = (i as f32 * 0.37) % 1.0;
+                items.push(Item {
+                    id: ItemId(next_id),
+                    cells,
+                    kind: Kind::Icon {
+                        desktop: icon.desktop.clone(),
+                        exec: parse_desktop(&icon.desktop),
+                        color: [0.25 + 0.4 * hue, 0.35, 0.65 - 0.2 * hue, 1.0],
+                    },
+                });
+                next_id += 1;
+            }
+        }
+
+        self.columns = cfg.columns.max(1);
+        self.rows = cfg.rows.max(1);
+        self.items = items;
+        self.page = self.page.min(self.page_count().saturating_sub(1));
+        if self.selected.is_some_and(|id| self.item(id).is_none()) {
+            self.selected = None;
+        }
+        let gone = match self.gesture {
+            Gesture::Lifted { item, .. } | Gesture::Resizing { item, .. } => {
+                self.item(item).is_none()
+            }
+            Gesture::Pending { item: Some(id), .. } => self.item(id).is_none(),
+            _ => false,
+        };
+        if gone {
+            self.gesture = Gesture::Idle;
+            self.frame_preview = None;
+            self.drag_snapshot = None;
+            self.page_edge = None;
+        }
+
+        HomeAction::Reload { close }
     }
 
     pub fn launch(&self, exec: &str) {
@@ -1277,6 +1412,54 @@ fn snap_span(length: f64, cell: f64, pitch: f64, max: u32) -> u32 {
     span.clamp(1, max as i32) as u32
 }
 
+fn cells_of_slot(slot: &SlotConfig) -> RectCells {
+    RectCells {
+        page: slot.page,
+        col: slot.col,
+        row: slot.row,
+        col_span: slot.col_span.max(1),
+        row_span: slot.row_span.max(1),
+    }
+}
+
+fn cells_of_icon(icon: &IconConfig) -> RectCells {
+    RectCells {
+        page: icon.page,
+        col: icon.col,
+        row: icon.row,
+        col_span: 1,
+        row_span: 1,
+    }
+}
+
+fn take_widget(old: &[Item], slot: &SlotConfig) -> Option<usize> {
+    let cells = cells_of_slot(slot);
+    old.iter()
+        .position(|item| {
+            matches!(&item.kind, Kind::Widget { command, .. } if command == &slot.command)
+                && item.cells == cells
+        })
+        .or_else(|| {
+            old.iter().position(|item| {
+                matches!(&item.kind, Kind::Widget { command, .. } if command == &slot.command)
+            })
+        })
+}
+
+fn take_icon(old: &[Item], icon: &IconConfig) -> Option<usize> {
+    let cells = cells_of_icon(icon);
+    old.iter()
+        .position(|item| {
+            matches!(&item.kind, Kind::Icon { desktop, .. } if desktop == &icon.desktop)
+                && item.cells == cells
+        })
+        .or_else(|| {
+            old.iter().position(|item| {
+                matches!(&item.kind, Kind::Icon { desktop, .. } if desktop == &icon.desktop)
+            })
+        })
+}
+
 fn overlaps(a: RectCells, b: RectCells) -> bool {
     a.page == b.page
         && a.col < b.col + b.col_span
@@ -1405,5 +1588,29 @@ mod tests {
         home.tick();
         assert_eq!(home.page, 0);
         assert_eq!(home.cells_of(id).page, 0);
+    }
+
+    #[test]
+    fn reload_moves_a_widget_slot_without_respawning() {
+        let path = std::env::temp_dir().join("homescreen-reload-test.toml");
+        let mut home = test_home(vec![widget(1, 0, 0, 0)]);
+        home.path = path.clone();
+        let toml = r#"
+columns = 4
+rows = 6
+[[slots]]
+page = 0
+col = 2
+row = 1
+col_span = 1
+row_span = 1
+command = "true"
+"#;
+        std::fs::write(&path, toml).unwrap();
+        let action = home.reload();
+        assert!(matches!(action, HomeAction::Reload { close } if close.is_empty()));
+        assert_eq!(home.cells_of(ItemId(1)).col, 2);
+        assert_eq!(home.cells_of(ItemId(1)).row, 1);
+        let _ = std::fs::remove_file(path);
     }
 }

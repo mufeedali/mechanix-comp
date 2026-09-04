@@ -22,6 +22,8 @@ The nest binds `wayland-widget-0` (then `-1`…). Widgets are ordinary xdg
 clients on that socket. Icons launch on the host `WAYLAND_DISPLAY`.
 
 Config: `$XDG_CONFIG_HOME/mechanix/homescreen.toml` (or `MECHANIX_HOME_CONFIG`).
+Defaults are written on every launch (FIXME). Edit the file while running to
+hot-reload slots.
 
 Gestures: swipe changes page (widgets do not see it). Tap a widget to click
 it; tap an icon to launch. Long-press enters edit mode. Hold-and-drag lifts

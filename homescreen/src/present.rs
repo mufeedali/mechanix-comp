@@ -19,7 +19,7 @@ use smithay::backend::renderer::damage::OutputDamageTracker;
 use smithay::backend::renderer::element::AsRenderElements;
 use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
 use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
-use smithay::backend::renderer::{Bind, ImportDma};
+use smithay::backend::renderer::{Bind, ImportDma, Texture};
 use smithay::desktop::layer_map_for_output;
 use smithay::input::pointer::MotionEvent;
 use smithay::output::{Mode, Output, PhysicalProperties, Scale, Subpixel};
@@ -39,6 +39,7 @@ use window_manager::{
 };
 
 use crate::chrome::Fill;
+use crate::config::ConfigWatch;
 use crate::home::{Home, HomeAction};
 
 const CLEAR: [f32; 4] = [0.1, 0.1, 0.1, 1.0];
@@ -85,6 +86,14 @@ impl Backend for LayerData {
 
     fn visible_surfaces(&self) -> Option<Vec<WlSurface>> {
         Some(self.home.visible_surfaces())
+    }
+}
+
+impl Drop for LayerData {
+    fn drop(&mut self) {
+        if let Some(tex) = self.slot_tex.take() {
+            std::mem::forget(tex);
+        }
     }
 }
 
@@ -155,6 +164,10 @@ struct Homescreen {
     #[lens(skip)]
     nest_token: Option<IoToken>,
     #[lens(skip)]
+    config_watch: Option<ConfigWatch>,
+    #[lens(skip)]
+    config_token: Option<IoToken>,
+    #[lens(skip)]
     tick_id: Option<TimerId>,
 }
 
@@ -187,6 +200,13 @@ impl Homescreen {
             Div::new(Default::default(), ()),
         );
         let nest = Nest::new(nest_gl)?;
+        let config_watch = match ConfigWatch::open(&crate::config::config_path()) {
+            Ok(watch) => Some(watch),
+            Err(err) => {
+                tracing::warn!(%err, "homescreen config watch disabled");
+                None
+            }
+        };
         Ok(Self {
             ring,
             wm,
@@ -195,6 +215,8 @@ impl Homescreen {
             nest,
             quit: false,
             nest_token: None,
+            config_watch,
+            config_token: None,
             tick_id: None,
         })
     }
@@ -204,6 +226,12 @@ impl Homescreen {
             let fd = self.nest.event_loop.as_raw_fd();
             let sqe = opcode::PollAdd::new(types::Fd(fd), libc::POLLIN as _).build();
             self.nest_token = Some(self.ring.proxy().push(sqe));
+        }
+        if self.config_token.is_none()
+            && let Some(watch) = &self.config_watch
+        {
+            let sqe = opcode::PollAdd::new(types::Fd(watch.as_raw_fd()), libc::POLLIN as _).build();
+            self.config_token = Some(self.ring.proxy().push(sqe));
         }
     }
 
@@ -221,6 +249,9 @@ impl Homescreen {
         let IoEvent::Completed { token, .. } = ev;
         if Some(*token) == self.nest_token {
             self.nest_token = None;
+        }
+        if Some(*token) == self.config_token {
+            self.config_token = None;
         }
     }
 
@@ -301,6 +332,14 @@ impl Homescreen {
     }
 
     fn pre_poll(&mut self) {
+        if self
+            .config_watch
+            .as_ref()
+            .is_some_and(ConfigWatch::take_changed)
+        {
+            let action = self.nest.state.backend_data.home.reload();
+            self.apply(action);
+        }
         self.pump_nest();
         let action = self.nest.state.backend_data.home.tick();
         self.apply(action);
@@ -344,6 +383,9 @@ impl Homescreen {
         };
         output.set_preferred(mode);
         layer_map_for_output(&output).arrange();
+        if let Some(old) = self.nest.state.backend_data.slot_tex.take() {
+            std::mem::forget(old);
+        }
         self.nest.state.backend_data.damage_tracker =
             Some(OutputDamageTracker::from_output(&output));
         self.nest.state.apply_layout(&output);
@@ -374,7 +416,11 @@ impl Homescreen {
             .render_frame(layer, true, |renderer, slot| {
                 let gl_id = slot.backend.color_tex_id();
                 let backend = &mut nest.state.backend_data;
-                if backend.slot_tex.as_ref().is_none_or(|t| t.tex_id() != gl_id) {
+                if backend
+                    .slot_tex
+                    .as_ref()
+                    .is_none_or(|t| t.tex_id() != gl_id || t.size() != size.into())
+                {
                     if let Some(old) = backend.slot_tex.take() {
                         std::mem::forget(old);
                     }
@@ -566,6 +612,22 @@ fn apply_home_action(state: &mut State<LayerData>, action: HomeAction) {
             {
                 toplevel.send_close();
             }
+            state.schedule_render();
+        }
+        HomeAction::Reload { close } => {
+            for surface in close {
+                if let Some(toplevel) = state
+                    .toplevels
+                    .get(&surface)
+                    .and_then(|ws| ws.window.toplevel().cloned())
+                {
+                    toplevel.send_close();
+                }
+            }
+            if let Some(output) = state.primary_output() {
+                state.apply_layout(&output);
+            }
+            raise_lifted(state);
             state.schedule_render();
         }
     }
