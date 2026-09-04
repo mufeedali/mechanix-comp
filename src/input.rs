@@ -156,7 +156,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         let state = evt.state();
         debug!(?keycode, ?state, "key");
         let serial = SERIAL_COUNTER.next_serial();
-        let time = Event::time_msec(&evt);
+        let time = Event::time(&evt);
         let mut suppressed_keys = self.suppressed_keys.clone();
         let keyboard = self.seat.get_keyboard().unwrap();
 
@@ -252,7 +252,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
                 slot: evt.slot(),
                 location: touch_location,
                 serial,
-                time: evt.time_msec(),
+                time: evt.time(),
             },
         );
     }
@@ -267,7 +267,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
             &UpEvent {
                 slot: evt.slot(),
                 serial,
-                time: evt.time_msec(),
+                time: evt.time(),
             },
         )
     }
@@ -287,7 +287,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
             &smithay::input::touch::MotionEvent {
                 slot: evt.slot(),
                 location: touch_location,
-                time: evt.time_msec(),
+                time: evt.time(),
             },
         );
     }
@@ -415,7 +415,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
                     &MotionEvent {
                         location: pos,
                         serial,
-                        time: event.time_msec(),
+                        time: event.time(),
                     },
                 );
                 pointer.frame(self);
@@ -439,7 +439,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
                     &MotionEvent {
                         location: pos,
                         serial,
-                        time: event.time_msec(),
+                        time: event.time(),
                     },
                 );
                 pointer.frame(self);
@@ -463,7 +463,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
                         button,
                         state: button_state,
                         serial,
-                        time: event.time_msec(),
+                        time: event.time(),
                     },
                 );
                 pointer.frame(self);
@@ -480,7 +480,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
                 let horizontal_amount_discrete = event.amount_v120(Axis::Horizontal);
                 let vertical_amount_discrete = event.amount_v120(Axis::Vertical);
 
-                let mut frame = AxisFrame::new(event.time_msec()).source(source);
+                let mut frame = AxisFrame::new(event.time()).source(source);
                 if horizontal_amount != 0.0 {
                     frame = frame.value(Axis::Horizontal, horizontal_amount);
                     if let Some(discrete) = horizontal_amount_discrete {
