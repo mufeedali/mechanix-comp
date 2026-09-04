@@ -18,6 +18,8 @@ use smithay::backend::input::ButtonState;
 use smithay::backend::renderer::damage::OutputDamageTracker;
 use smithay::backend::renderer::element::AsRenderElements;
 use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
+use smithay::backend::renderer::element::utils::CropRenderElement;
+use smithay::desktop::{Window, WindowSurfaceType};
 use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
 use smithay::backend::renderer::{Bind, ImportDma, Texture};
 use smithay::desktop::layer_map_for_output;
@@ -46,7 +48,8 @@ const CLEAR: [f32; 4] = [0.1, 0.1, 0.1, 1.0];
 
 type Chrome = Div<()>;
 
-pub struct LayerData {
+/// Homescreen `Backend`, same role as `UdevData` / `WinitData`.
+pub struct MechaData {
     nest_gl: GlesRenderer,
     damage_tracker: Option<OutputDamageTracker>,
     pending_render: bool,
@@ -57,7 +60,7 @@ pub struct LayerData {
     slot_tex: Option<GlesTexture>,
 }
 
-impl Backend for LayerData {
+impl Backend for MechaData {
     fn renderer(&mut self) -> &mut GlesRenderer {
         &mut self.nest_gl
     }
@@ -89,7 +92,7 @@ impl Backend for LayerData {
     }
 }
 
-impl Drop for LayerData {
+impl Drop for MechaData {
     fn drop(&mut self) {
         if let Some(tex) = self.slot_tex.take() {
             std::mem::forget(tex);
@@ -146,8 +149,8 @@ fn queue_fills(renderer: &mut Renderer, fills: &[Fill]) {
 }
 
 struct Nest {
-    event_loop: EventLoop<'static, State<LayerData>>,
-    state: State<LayerData>,
+    event_loop: EventLoop<'static, State<MechaData>>,
+    state: State<MechaData>,
 }
 
 #[derive(State)]
@@ -163,6 +166,9 @@ struct Homescreen {
     quit: bool,
     #[lens(skip)]
     nest_token: Option<IoToken>,
+    /// Set when the nest calloop fd woke. `dispatch` only then.
+    #[lens(skip)]
+    nest_readable: bool,
     #[lens(skip)]
     config_watch: Option<ConfigWatch>,
     #[lens(skip)]
@@ -215,6 +221,7 @@ impl Homescreen {
             nest,
             quit: false,
             nest_token: None,
+            nest_readable: false,
             config_watch,
             config_token: None,
             tick_id: None,
@@ -249,6 +256,7 @@ impl Homescreen {
         let IoEvent::Completed { token, .. } = ev;
         if Some(*token) == self.nest_token {
             self.nest_token = None;
+            self.nest_readable = true;
         }
         if Some(*token) == self.config_token {
             self.config_token = None;
@@ -261,11 +269,14 @@ impl Homescreen {
         }
     }
 
-    fn pump_nest(&mut self) {
+    fn dispatch_nest(&mut self) {
         let _ = self
             .nest
             .event_loop
             .dispatch(Duration::ZERO, &mut self.nest.state);
+    }
+
+    fn nest_idle(&mut self) {
         self.nest.state.on_idle();
         self.nest.state.backend_data.home.reap();
         self.nest
@@ -340,9 +351,13 @@ impl Homescreen {
             let action = self.nest.state.backend_data.home.reload();
             self.apply(action);
         }
-        self.pump_nest();
+        if self.nest_readable {
+            self.nest_readable = false;
+            self.dispatch_nest();
+        }
         let action = self.nest.state.backend_data.home.tick();
         self.apply(action);
+        self.nest_idle();
         if self.nest.state.backend_data.pending_render
             && let Err(err) = self.present()
         {
@@ -371,7 +386,7 @@ impl Homescreen {
                     serial_number: "0".into(),
                 },
             );
-            let _global = output.create_global::<State<LayerData>>(&self.nest.state.display_handle);
+            let _global = output.create_global::<State<MechaData>>(&self.nest.state.display_handle);
             output.change_current_state(
                 Some(mode),
                 Some(Transform::Normal),
@@ -474,12 +489,12 @@ impl Homescreen {
 
 impl Nest {
     fn new(nest_gl: GlesRenderer) -> Result<Self, Box<dyn std::error::Error>> {
-        let mut event_loop: EventLoop<State<LayerData>> = EventLoop::try_new()?;
-        let display: Display<State<LayerData>> = Display::new()?;
+        let mut event_loop: EventLoop<State<MechaData>> = EventLoop::try_new()?;
+        let display: Display<State<MechaData>> = Display::new()?;
         let mut state = State::new_with_socket(
             &mut event_loop,
             display,
-            LayerData {
+            MechaData {
                 nest_gl,
                 damage_tracker: None,
                 pending_render: false,
@@ -497,7 +512,7 @@ impl Nest {
         let dmabuf_formats = state.backend_data.renderer().dmabuf_formats();
         let dmabuf_global = state
             .dmabuf_state
-            .create_global::<State<LayerData>>(&state.display_handle, dmabuf_formats);
+            .create_global::<State<MechaData>>(&state.display_handle, dmabuf_formats);
         state.dmabuf_global = Some(dmabuf_global);
 
         info!(
@@ -534,9 +549,9 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn nest_elements(
-    state: &mut State<LayerData>,
+    state: &mut State<MechaData>,
     output: &Output,
-) -> Vec<WaylandSurfaceRenderElement<GlesRenderer>> {
+) -> Vec<CropRenderElement<WaylandSurfaceRenderElement<GlesRenderer>>> {
     let scale = output.current_scale().fractional_scale();
     let origin = state
         .space
@@ -549,25 +564,51 @@ fn nest_elements(
         .visible_surfaces()
         .into_iter()
         .filter_map(|surface| {
+            let clip = state.backend_data.home.placement(&surface)?;
             let ws = state.toplevels.get(&surface)?;
             let loc = state.space.element_location(&ws.window)?;
-            Some((ws.window.clone(), loc - origin))
+            Some((ws.window.clone(), loc - origin, clip.loc - origin, clip.size))
         })
         .collect();
     let renderer = &mut state.backend_data.nest_gl;
     let mut elements = Vec::new();
-    for (window, loc) in &tiles {
-        elements.extend(window.render_elements::<WaylandSurfaceRenderElement<GlesRenderer>>(
+    for (window, loc, clip_loc, clip_size) in &tiles {
+        let crop = Rectangle::new(*clip_loc, *clip_size).to_physical_precise_round(scale);
+        for elem in window.render_elements::<WaylandSurfaceRenderElement<GlesRenderer>>(
             renderer,
             loc.to_physical_precise_round(scale),
             smithay::utils::Scale::from(scale),
             1.0,
-        ));
+        ) {
+            if let Some(cropped) = CropRenderElement::from_element(elem, scale, crop) {
+                elements.push(cropped);
+            }
+        }
     }
     elements
 }
 
-fn raise_lifted(state: &mut State<LayerData>) {
+/// Topmost claimed window whose slot contains `pos`. Overflow outside the
+/// slot is not hittable.
+fn nest_window_at(state: &State<MechaData>, pos: Point<f64, Logical>) -> Option<Window> {
+    let p = (pos.x.round() as i32, pos.y.round() as i32);
+    for window in state.space.elements().rev() {
+        let Some(surface) = window.toplevel().map(|t| t.wl_surface().clone()) else {
+            continue;
+        };
+        if state
+            .backend_data
+            .home
+            .placement(&surface)
+            .is_some_and(|geo| geo.contains(p))
+        {
+            return Some(window.clone());
+        }
+    }
+    None
+}
+
+fn raise_lifted(state: &mut State<MechaData>) {
     if let Some(surface) = state.backend_data.home.lifted_surface()
         && let Some(ws) = state.toplevels.get(&surface)
     {
@@ -575,7 +616,7 @@ fn raise_lifted(state: &mut State<LayerData>) {
     }
 }
 
-fn apply_home_action(state: &mut State<LayerData>, action: HomeAction) {
+fn apply_home_action(state: &mut State<MechaData>, action: HomeAction) {
     match action {
         HomeAction::None => {}
         HomeAction::Redraw => state.schedule_render(),
@@ -633,12 +674,18 @@ fn apply_home_action(state: &mut State<LayerData>, action: HomeAction) {
     }
 }
 
-fn tap_widget(state: &mut State<LayerData>, pos: Point<f64, Logical>) {
+fn tap_widget(state: &mut State<MechaData>, pos: Point<f64, Logical>) {
     let serial = SERIAL_COUNTER.next_serial();
-    if let Some(window) = state.space.element_under(pos).map(|(w, _)| w.clone()) {
-        state.focus_window(&window, serial);
+    let window = nest_window_at(state, pos);
+    if let Some(window) = window.as_ref() {
+        state.focus_window(window, serial);
     }
-    let under = state.surface_under(pos);
+    let under = window.and_then(|window| {
+        let loc = state.space.element_location(&window)?;
+        window
+            .surface_under(pos - loc.to_f64(), WindowSurfaceType::ALL)
+            .map(|(surface, local)| (surface, (local + loc).to_f64()))
+    });
     let pointer = state.pointer.clone();
     pointer.motion(
         state,
