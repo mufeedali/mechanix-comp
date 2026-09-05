@@ -22,11 +22,11 @@ use smithay::backend::renderer::element::{AsRenderElements, Kind};
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::backend::session::libseat::LibSeatSession;
 use smithay::backend::session::{Event as SessionEvent, Session};
-use smithay::backend::udev::{UdevBackend, UdevEvent, primary_gpu};
+use smithay::backend::udev::{UdevBackend, UdevEvent};
 use smithay::input::pointer::{CursorImageAttributes, CursorImageStatus};
 use smithay::output::{Mode as WlMode, Output, PhysicalProperties, Scale};
 use smithay::reexports::calloop::{EventLoop, LoopHandle, RegistrationToken};
-use smithay::reexports::drm::control::{ModeTypeFlags, connector, crtc};
+use smithay::reexports::drm::control::{Device as ControlDevice, ModeTypeFlags, connector, crtc};
 use smithay::reexports::input::AccelProfile;
 use smithay::reexports::input::{DeviceCapability, Libinput};
 use smithay::reexports::rustix::fs::OFlags;
@@ -93,9 +93,7 @@ struct DeviceData {
 pub struct UdevData {
     session: LibSeatSession,
     loop_handle: LoopHandle<'static, State<UdevData>>,
-    primary_gpu: DrmNode,
-    /// Single GLES renderer bound to the primary GPU. Created when the primary
-    /// device is added.
+    /// The one GLES renderer; made on the first KMS card, reused by later ones.
     renderer: Option<GlesRenderer>,
     devices: HashMap<DrmNode, DeviceData>,
     keyboards: Vec<smithay::reexports::input::Device>,
@@ -117,7 +115,7 @@ impl Backend for UdevData {
     fn renderer(&mut self) -> &mut GlesRenderer {
         self.renderer
             .as_mut()
-            .expect("primary GPU renderer not initialized")
+            .expect("KMS renderer not initialized")
     }
 
     fn seat_name(&self) -> String {
@@ -210,41 +208,28 @@ impl UdevData {
     }
 }
 
-/// Take over the session, open the primary GPU, light up its first connected
-/// connector, and run the event loop to completion.
+/// KMS-capable = has modeset resources; render-only cards (etnaviv) don't.
+fn is_kms_card(fd: &DrmDeviceFd) -> bool {
+    fd.resource_handles()
+        .is_ok_and(|res| {
+            !res.crtcs().is_empty()
+                && !res.connectors().is_empty()
+                && !res.encoders().is_empty()
+        })
+}
+
+/// Open every KMS card and run the event loop to completion.
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut event_loop: EventLoop<'static, State<UdevData>> = EventLoop::try_new()?;
     let display: Display<State<UdevData>> = Display::new()?;
 
     let (session, notifier) = LibSeatSession::new()?;
-
-    // Pick the primary GPU and normalize to its primary (card) node, which is
-    // the one that carries KMS/modesetting.
-    let primary_path = if let Ok(custom_dev) =
-        std::env::var("MECHA_DRM_DEVICE").or_else(|_| std::env::var("WLR_DRM_DEVICES"))
-    {
-        let p = std::path::PathBuf::from(&custom_dev);
-        if p.exists() {
-            p
-        } else {
-            let candidate = std::path::PathBuf::from(format!("/dev/dri/{custom_dev}"));
-            if candidate.exists() { candidate } else { p }
-        }
-    } else {
-        primary_gpu(session.seat())?.ok_or("no GPU found for seat")?
-    };
-    let primary_node = DrmNode::from_path(&primary_path)?;
-    let primary_gpu = primary_node
-        .node_with_type(NodeType::Primary)
-        .and_then(|n| n.ok())
-        .unwrap_or(primary_node);
-    info!("Using {primary_gpu} ({primary_path:?}) as primary GPU");
+    let udev_backend = UdevBackend::new(session.seat())?;
 
     let loop_handle = event_loop.handle();
     let udev_data = UdevData {
         session,
         loop_handle: loop_handle.clone(),
-        primary_gpu,
         renderer: None,
         devices: HashMap::new(),
         keyboards: Vec::new(),
@@ -258,7 +243,6 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut state = State::new(&mut event_loop, display, udev_data);
 
-    let udev_backend = UdevBackend::new(state.seat.name())?;
     // Initialize libinput backend
     let mut libinput_context = Libinput::new_with_udev::<LibinputSessionInterface<LibSeatSession>>(
         state.backend_data.session.clone().into(),
@@ -319,18 +303,17 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         })
         .unwrap();
 
-    // Enumerate DRM devices; add the primary one (single-GPU: others ignored).
-    let primary_dev_id = primary_gpu.dev_id();
-    if let Some((_, path)) = udev_backend
-        .device_list()
-        .find(|(dev_id, _)| *dev_id == primary_dev_id)
-    {
-        if let Err(err) = state.device_added(primary_gpu, path) {
-            error!("Failed to initialize primary GPU: {err}");
-            return Err(err);
+    // Open every KMS-capable card.
+    for (device_id, path) in udev_backend.device_list() {
+        let Ok(node) = DrmNode::from_dev_id(device_id) else {
+            continue;
+        };
+        if let Err(err) = state.device_added(node, path) {
+            error!("Failed to add DRM device {device_id}: {err}");
         }
-    } else {
-        return Err(format!("primary GPU {primary_gpu} not found in udev device list").into());
+    }
+    if state.backend_data.renderer.is_none() {
+        return Err("no KMS-capable DRM device found".into());
     }
 
     // Session pause/resume across VT switches.
@@ -350,15 +333,12 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
         })?;
 
-    // GPU / connector hotplug. New GPUs are ignored (single-GPU); connector
-    // changes on the primary are honored, primary removal is handled.
+    // GPU / connector hotplug.
     event_loop
         .handle()
         .insert_source(udev_backend, move |event, _, state| match event {
             UdevEvent::Added { device_id, path } => {
-                if device_id == primary_dev_id
-                    && let Ok(node) = DrmNode::from_dev_id(device_id)
-                    && !state.backend_data.devices.contains_key(&node)
+                if let Ok(node) = DrmNode::from_dev_id(device_id)
                     && let Err(err) = state.device_added(node, &path)
                 {
                     error!("Failed to add device {device_id}: {err}");
@@ -401,9 +381,10 @@ impl State<UdevData> {
         node: DrmNode,
         path: &Path,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        // Single-GPU: we only ever render on and scan out from the primary GPU.
-        if node != self.backend_data.primary_gpu {
-            info!("Ignoring non-primary GPU {node}");
+        if node.ty() != NodeType::Primary {
+            return Ok(());
+        }
+        if self.backend_data.devices.contains_key(&node) {
             return Ok(());
         }
 
@@ -412,6 +393,10 @@ impl State<UdevData> {
             OFlags::RDWR | OFlags::CLOEXEC | OFlags::NOCTTY | OFlags::NONBLOCK,
         )?;
         let fd = DrmDeviceFd::new(DeviceFd::from(fd));
+        if !is_kms_card(&fd) {
+            info!("Ignoring {node}: not a KMS device");
+            return Ok(());
+        }
 
         let (drm, drm_notifier) = DrmDevice::new(fd.clone(), true)?;
         let gbm = GbmDevice::new(fd)?;
@@ -425,46 +410,46 @@ impl State<UdevData> {
             },
         )?;
 
-        // Build the single GLES renderer on the primary GPU.
-        let egl_display = unsafe { EGLDisplay::new(gbm.clone())? };
-        let egl_context = EGLContext::new(&egl_display)?;
-        let render_formats = egl_context.dmabuf_render_formats().clone();
-        let renderer = unsafe { GlesRenderer::new(egl_context)? };
+        // One GLES renderer, reused across all cards.
+        let render_formats = if let Some(renderer) = self.backend_data.renderer.as_mut() {
+            renderer.egl_context().dmabuf_render_formats().clone()
+        } else {
+            let egl_display = unsafe { EGLDisplay::new(gbm.clone())? };
+            let egl_context = EGLContext::new(&egl_display)?;
+            let render_formats = egl_context.dmabuf_render_formats().clone();
+            let renderer = unsafe { GlesRenderer::new(egl_context)? };
 
-        // Advertise zwp_linux_dmabuf_v1 now that the primary renderer exists.
-        //
-        // We must tell clients *which* render node to use for buffer sharing. The
-        // correct way to find this is to ask EGL itself — `EGLDevice::device_for_display`
-        // returns the device EGL actually opened (on kmsro/lcdif boards like REV7 this
-        // is the etnaviv renderD128, not the display controller card2). Falling back to
-        // `node` (the card node) would give clients an fd of -1 and break EGL init.
-        if self.dmabuf_global.is_none() {
-            let dmabuf_formats = renderer.dmabuf_formats();
+            // Ask EGL which render node to advertise: the card node may be a
+            // display-only controller (kmsro), not the render GPU.
+            if self.dmabuf_global.is_none() {
+                let dmabuf_formats = renderer.dmabuf_formats();
 
-            let render_node = super::egl_render_node(&egl_display)
-                // Fallback for real GPU cards whose card node has a render peer.
-                .or_else(|| node.node_with_type(NodeType::Render).and_then(|r| r.ok()));
+                let render_node = super::egl_render_node(&egl_display)
+                    .or_else(|| node.node_with_type(NodeType::Render).and_then(|r| r.ok()));
 
-            let main_device_id = render_node
-                .map(|n| n.dev_id())
-                .unwrap_or_else(|| node.dev_id());
+                let main_device_id = render_node
+                    .map(|n| n.dev_id())
+                    .unwrap_or_else(|| node.dev_id());
 
-            let default_feedback = smithay::wayland::dmabuf::DmabufFeedbackBuilder::new(
-                main_device_id,
-                dmabuf_formats,
-            )
-            .build()
-            .unwrap();
+                let default_feedback = smithay::wayland::dmabuf::DmabufFeedbackBuilder::new(
+                    main_device_id,
+                    dmabuf_formats,
+                )
+                .build()
+                .unwrap();
 
-            let global = self
-                .dmabuf_state
-                .create_global_with_default_feedback::<State<UdevData>>(
-                    &self.display_handle,
-                    &default_feedback,
-                );
-            self.dmabuf_global = Some(global);
-        }
-        self.backend_data.renderer = Some(renderer);
+                let global = self
+                    .dmabuf_state
+                    .create_global_with_default_feedback::<State<UdevData>>(
+                        &self.display_handle,
+                        &default_feedback,
+                    );
+                self.dmabuf_global = Some(global);
+            }
+            info!("Using {node} as the display device");
+            self.backend_data.renderer = Some(renderer);
+            render_formats
+        };
 
         let allocator = GbmAllocator::new(
             gbm.clone(),
