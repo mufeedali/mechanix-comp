@@ -301,14 +301,14 @@ fn tap_widget_pointer(state: &mut State<MechaData>, pos: Point<f64, Logical>) {
         &MotionEvent {
             location: pos,
             serial,
-            time: 0,
+            time: smithay::backend::input::InputTime::now(),
         },
     );
     pointer.button(
         state,
         &smithay::input::pointer::ButtonEvent {
             serial,
-            time: 0,
+            time: smithay::backend::input::InputTime::now(),
             button: 0x110,
             state: ButtonState::Pressed,
         },
@@ -317,7 +317,7 @@ fn tap_widget_pointer(state: &mut State<MechaData>, pos: Point<f64, Logical>) {
         state,
         &smithay::input::pointer::ButtonEvent {
             serial: SERIAL_COUNTER.next_serial(),
-            time: 0,
+            time: smithay::backend::input::InputTime::now(),
             button: 0x110,
             state: ButtonState::Released,
         },
@@ -343,7 +343,7 @@ fn tap_widget_touch(state: &mut State<MechaData>, pos: Point<f64, Logical>, id: 
             slot,
             location: pos,
             serial,
-            time: 0,
+            time: smithay::backend::input::InputTime::now(),
         },
     );
     touch.up(
@@ -351,7 +351,7 @@ fn tap_widget_touch(state: &mut State<MechaData>, pos: Point<f64, Logical>, id: 
         &smithay::input::touch::UpEvent {
             slot,
             serial: SERIAL_COUNTER.next_serial(),
-            time: 0,
+            time: smithay::backend::input::InputTime::now(),
         },
     );
     touch.frame(state);
