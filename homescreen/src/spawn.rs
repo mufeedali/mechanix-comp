@@ -1,13 +1,39 @@
 //! Start nest widgets and host apps.
 
 use std::ffi::OsStr;
-use std::process::{Child, Command};
+use std::os::unix::process::CommandExt;
+use std::process::{Child, Command, Stdio};
 
 pub(crate) fn spawn_on_nest(command: &str, nest: &OsStr) -> std::io::Result<Child> {
     let mut cmd = Command::new("sh");
     cmd.arg("-c").arg(command);
     apply_wayland_only(&mut cmd, nest);
     cmd.spawn()
+}
+
+/// Start `exec` on the host display and detach so it outlives this process.
+pub(crate) fn launch_on_host(exec: &str, display: &OsStr) -> std::io::Result<()> {
+    let mut cmd = Command::new("sh");
+    cmd.arg("-c").arg(exec);
+    apply_wayland_only(&mut cmd, display);
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            match libc::fork() {
+                0 => Ok(()),
+                -1 => Err(std::io::Error::last_os_error()),
+                _ => libc::_exit(0),
+            }
+        });
+    }
+    let mut child = cmd.spawn()?;
+    let _ = child.wait();
+    Ok(())
 }
 
 pub(crate) fn apply_wayland_only(cmd: &mut Command, display: &OsStr) {

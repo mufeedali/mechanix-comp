@@ -1,6 +1,6 @@
 use std::ffi::OsStr;
 use std::path::PathBuf;
-use std::process::{Child, Command};
+use std::process::Child;
 use std::time::{Duration, Instant};
 
 use animation::{Animated, AnimationConfig, Easing, monotonic_now};
@@ -1167,11 +1167,8 @@ impl Home {
             warn!(exec, "icon launch skipped: no host WAYLAND_DISPLAY");
             return;
         };
-        let mut cmd = Command::new("sh");
-        cmd.arg("-c").arg(exec);
-        spawn::apply_wayland_only(&mut cmd, &display);
-        match cmd.spawn() {
-            Ok(child) => info!(pid = child.id(), exec, "launched icon on host"),
+        match spawn::launch_on_host(exec, &display) {
+            Ok(()) => info!(exec, "launched icon on host"),
             Err(err) => warn!(%err, exec, "icon launch failed"),
         }
     }
