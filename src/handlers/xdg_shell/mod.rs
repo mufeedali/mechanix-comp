@@ -25,9 +25,15 @@ impl<BackendData: Backend + 'static> XdgShellHandler for State<BackendData> {
     fn new_toplevel(&mut self, surface: ToplevelSurface) {
         let window = Window::new_wayland_window(surface.clone());
 
-        // `set_parent` hasn't arrived yet, so only set bounds here; the first
-        // commit decides sizing/mapping in `handle_commit`.
-        if let Some(output) = self.space.outputs().next().cloned() {
+        self.backend_data.on_new_toplevel(surface.wl_surface());
+        if let Some(geo) = self.backend_data.placement(surface.wl_surface()) {
+            surface.with_pending_state(|state| {
+                state.size = Some(geo.size);
+                state.states.set(xdg_toplevel::State::Maximized);
+            });
+        } else if let Some(output) = self.space.outputs().next().cloned() {
+            // `set_parent` hasn't arrived yet, so only set bounds here; the first
+            // commit decides sizing/mapping in `handle_commit`.
             let zone = layer_map_for_output(&output).non_exclusive_zone();
             surface.with_pending_state(|state| {
                 state.bounds = Some(zone.size);
@@ -49,6 +55,7 @@ impl<BackendData: Backend + 'static> XdgShellHandler for State<BackendData> {
         // The foreign-toplevel `closed` event is sent by
         // `foreign_toplevel_refresh` on the next idle callback.
         let wl = surface.wl_surface();
+        self.backend_data.on_unmapped(wl);
         for layout in self.layouts.values_mut() {
             layout.remove(wl);
         }
@@ -292,9 +299,15 @@ impl<BackendData: Backend + 'static> State<BackendData> {
     fn handle_toplevel_first_commit(&mut self, surface: &WlSurface, window: &Window) {
         let toplevel = window.toplevel().unwrap();
         let output = self.space.outputs().next().cloned();
-        let loc = output
-            .as_ref()
-            .map(|o| layer_map_for_output(o).non_exclusive_zone().loc)
+        let loc = self
+            .backend_data
+            .placement(surface)
+            .map(|geo| geo.loc)
+            .or_else(|| {
+                output
+                    .as_ref()
+                    .map(|o| layer_map_for_output(o).non_exclusive_zone().loc)
+            })
             .unwrap_or_default();
 
         if let Some(output) = &output {
