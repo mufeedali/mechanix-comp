@@ -280,14 +280,12 @@ impl<BackendData: Backend + 'static> State<BackendData> {
     }
 
     /// Per-frame bookkeeping shared by udev, winit, and the homescreen nest.
-    /// Returns toplevels dropped because the client died without `toplevel_destroyed`.
-    pub fn on_idle(&mut self) -> Vec<WlSurface> {
+    pub fn on_idle(&mut self) {
         self.space.refresh();
         self.popups.cleanup();
-        let dropped = self.cleanup_toplevels();
+        self.cleanup_toplevels();
         self.update_keyboard_focus();
         let _ = self.display_handle.flush_clients();
-        dropped
     }
 
     /// Queue a redraw on every output; the backend skips ones already pending.
@@ -425,20 +423,13 @@ impl<BackendData: Backend + 'static> State<BackendData> {
 
     /// Prune bookkeeping for toplevels whose client went away without the
     /// `toplevel_destroyed` path (e.g. a crash); dropping the entry also drops
-    /// its foreign-toplevel handle. Returns the surfaces that were removed.
-    pub fn cleanup_toplevels(&mut self) -> Vec<WlSurface> {
-        let mut dropped = Vec::new();
-        self.toplevels.retain(|surface, ws| {
-            let alive = ws.window.toplevel().unwrap().wl_surface().is_alive();
-            if !alive {
-                dropped.push(surface.clone());
-            }
-            alive
-        });
+    /// its foreign-toplevel handle.
+    pub fn cleanup_toplevels(&mut self) {
+        self.toplevels
+            .retain(|_, ws| ws.window.toplevel().unwrap().wl_surface().is_alive());
         for layout in self.layouts.values_mut() {
             layout.retain(|s| s.is_alive());
         }
-        dropped
     }
 
     /// The topmost window currently marked modal, if any. While open, input to

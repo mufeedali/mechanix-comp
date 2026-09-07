@@ -8,6 +8,7 @@ pub(crate) fn spawn_on_nest(command: &str, nest: &OsStr) -> std::io::Result<Chil
     let mut cmd = Command::new("sh");
     cmd.arg("-c").arg(command);
     apply_wayland_only(&mut cmd, nest);
+    cmd.process_group(0);
     cmd.spawn()
 }
 

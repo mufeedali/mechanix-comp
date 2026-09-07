@@ -4,6 +4,7 @@ use std::process::Child;
 use std::time::{Duration, Instant};
 
 use animation::{Animated, AnimationConfig, Easing, monotonic_now};
+use smithay::reexports::wayland_server::Resource;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::{Logical, Point, Rectangle, Size};
 use tracing::{info, warn};
@@ -346,40 +347,40 @@ impl Home {
         }
     }
 
-    pub fn claim(&mut self, surface: &WlSurface) {
+    /// Attach `surface` only if it belongs to the process this slot started.
+    pub fn attach_spawned(&mut self, surface: &WlSurface, client_pid: u32) -> bool {
         if self.items.iter().any(|i| i.owns_surface(surface)) {
-            return;
+            return true;
         }
         let Some(item) = self.items.iter_mut().find(|i| i.pending_claim()) else {
-            return;
+            return false;
         };
-        if let Kind::Widget {
+        let Kind::Widget {
             command,
             surface: slot,
+            child,
             ever_mapped,
             ..
         } = &mut item.kind
-        {
-            info!(cmd = %command, "claimed nest toplevel for slot");
-            *slot = Some(surface.clone());
-            *ever_mapped = true;
+        else {
+            return false;
+        };
+        let Some(proc) = child.as_ref() else {
+            return false;
+        };
+        if !spawn_owns_pid(proc.id(), client_pid) {
+            return false;
         }
+        info!(cmd = %command, pid = client_pid, "claimed nest toplevel for slot");
+        *slot = Some(surface.clone());
+        *ever_mapped = true;
+        true
     }
 
-    pub fn mapped_widgets(&self) -> Vec<WlSurface> {
-        self.items
-            .iter()
-            .filter_map(|i| match &i.kind {
-                Kind::Widget { surface, .. } => surface.clone(),
-                Kind::Icon { .. } => None,
-            })
-            .collect()
-    }
-
-    pub fn release(&mut self, surface: &WlSurface) {
+    pub fn release_dead(&mut self) {
         for item in &mut self.items {
             if let Kind::Widget { surface: slot, .. } = &mut item.kind
-                && slot.as_ref() == Some(surface)
+                && slot.as_ref().is_some_and(|s| !s.is_alive())
             {
                 *slot = None;
             }
@@ -1346,6 +1347,14 @@ impl Home {
             },
         )
     }
+}
+
+fn spawn_owns_pid(spawn_pid: u32, client_pid: u32) -> bool {
+    if client_pid == spawn_pid {
+        return true;
+    }
+    let pgid = unsafe { libc::getpgid(client_pid as i32) };
+    pgid >= 0 && pgid as u32 == spawn_pid
 }
 
 fn cells_of_slot(slot: &SlotConfig) -> RectCells {

@@ -19,6 +19,7 @@ use smithay::input::pointer::MotionEvent;
 use smithay::output::Output;
 use smithay::reexports::calloop::EventLoop;
 use smithay::reexports::wayland_server::Display;
+use smithay::reexports::wayland_server::Resource;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::{Logical, Point, Rectangle, SERIAL_COUNTER};
 use tracing::info;
@@ -100,11 +101,9 @@ impl Nest {
     }
 
     pub fn idle(&mut self) {
-        let dropped = self.state.on_idle();
-        for surface in &dropped {
-            self.state.backend_data.home.release(surface);
-        }
-        sync_claims(&mut self.state);
+        self.state.on_idle();
+        self.state.backend_data.home.release_dead();
+        attach_spawned(&mut self.state);
         configure_slots(&mut self.state);
         self.state.backend_data.home.reap();
         self.state
@@ -239,23 +238,31 @@ pub(crate) fn apply_home_action(state: &mut State<NestBackend>, action: HomeActi
                     toplevel.send_close();
                 }
             }
-            sync_claims(state);
+            state.backend_data.home.release_dead();
+            attach_spawned(state);
             configure_slots(state);
             state.schedule_render();
         }
     }
 }
 
-fn sync_claims(state: &mut State<NestBackend>) {
-    let live: HashSet<WlSurface> = state.toplevels.keys().cloned().collect();
-    for surface in &live {
-        state.backend_data.home.claim(surface);
+fn attach_spawned(state: &mut State<NestBackend>) {
+    let surfaces: Vec<WlSurface> = state.toplevels.keys().cloned().collect();
+    for surface in surfaces {
+        let Some(pid) = client_pid(&surface, &state.display_handle) else {
+            continue;
+        };
+        state.backend_data.home.attach_spawned(&surface, pid);
     }
-    for surface in state.backend_data.home.mapped_widgets() {
-        if !live.contains(&surface) {
-            state.backend_data.home.release(&surface);
-        }
-    }
+}
+
+fn client_pid(
+    surface: &WlSurface,
+    dh: &smithay::reexports::wayland_server::DisplayHandle,
+) -> Option<u32> {
+    let client = surface.client()?;
+    let creds = client.get_credentials(dh).ok()?;
+    Some(creds.pid as u32)
 }
 
 fn configure_slots(state: &mut State<NestBackend>) {
