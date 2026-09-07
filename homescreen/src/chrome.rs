@@ -112,13 +112,22 @@ pub fn handle_anchor(tile: Rectangle<i32, Logical>, handle: Handle) -> Point<f64
     }
 }
 
+fn handle_size(handle: Handle) -> (i32, i32) {
+    match handle {
+        Handle::Left | Handle::Right => (HANDLE_H, HANDLE_W),
+        Handle::Top | Handle::Bottom => (HANDLE_W, HANDLE_H),
+        _ => (HANDLE_W, HANDLE_W),
+    }
+}
+
 pub fn handle_rect(tile: Rectangle<i32, Logical>, handle: Handle) -> Rectangle<i32, Logical> {
     let a = handle_anchor(tile, handle);
+    let (w, h) = handle_size(handle);
     rect(
-        a.x.round() as i32 - HANDLE_W / 2,
-        a.y.round() as i32 - HANDLE_H / 2,
-        HANDLE_W,
-        HANDLE_H,
+        a.x.round() as i32 - w / 2,
+        a.y.round() as i32 - h / 2,
+        w,
+        h,
     )
 }
 
@@ -232,8 +241,9 @@ mod tests {
         for handle in Handle::ALL {
             let a = handle_anchor(t, handle);
             let r = handle_rect(t, handle);
-            assert_eq!(r.size.w, HANDLE_W);
-            assert_eq!(r.size.h, HANDLE_H);
+            let (w, h) = handle_size(handle);
+            assert_eq!(r.size.w, w);
+            assert_eq!(r.size.h, h);
             let cx = r.loc.x as f64 + r.size.w as f64 / 2.0;
             let cy = r.loc.y as f64 + r.size.h as f64 / 2.0;
             assert!((cx - a.x).abs() < 1.0);

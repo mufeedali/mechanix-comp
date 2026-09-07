@@ -86,6 +86,8 @@ enum Gesture {
         start: Point<f64, Logical>,
         t0: Instant,
         item: Option<ItemId>,
+        /// `Some` if this contact is a finger (`wl_touch` id).
+        touch_id: Option<i32>,
     },
     Swipe {
         start_x: f64,
@@ -123,7 +125,11 @@ pub enum HomeAction {
     /// Move the lifted surface in Space only — no xdg configure.
     Relocate,
     Relayout,
-    TapWidget(Point<f64, Logical>),
+    TapWidget {
+        pos: Point<f64, Logical>,
+        /// Nest `wl_touch` slot. `None` is a nest pointer click.
+        touch_id: Option<i32>,
+    },
     Launch(String),
     CloseSurface(WlSurface),
     /// Config changed: close leftover nest surfaces, then relayout.
@@ -438,6 +444,14 @@ impl Home {
     }
 
     pub fn pointer_down(&mut self, pos: Point<f64, Logical>) -> HomeAction {
+        self.contact_down(pos, None)
+    }
+
+    pub fn touch_down(&mut self, pos: Point<f64, Logical>, id: i32) -> HomeAction {
+        self.contact_down(pos, Some(id))
+    }
+
+    fn contact_down(&mut self, pos: Point<f64, Logical>, touch_id: Option<i32>) -> HomeAction {
         self.last_pos = pos;
         self.settle = None;
         if let Some(id) = self.hit_close(pos) {
@@ -465,6 +479,7 @@ impl Home {
             start: pos,
             t0: Instant::now(),
             item,
+            touch_id,
         };
         if item.is_some() {
             self.wait = Some(LONG_PRESS);
@@ -534,7 +549,12 @@ impl Home {
     pub fn pointer_up(&mut self, pos: Point<f64, Logical>) -> HomeAction {
         let g = std::mem::replace(&mut self.gesture, Gesture::Idle);
         match g {
-            Gesture::Pending { start, t0, item } => {
+            Gesture::Pending {
+                start,
+                t0,
+                item,
+                touch_id,
+            } => {
                 let dt = Instant::now().saturating_duration_since(t0);
                 let dist = (pos.x - start.x).hypot(pos.y - start.y);
                 if dt >= LONG_PRESS && dist <= SLOP && let Some(id) = item {
@@ -554,7 +574,7 @@ impl Home {
                         }
                     }
                     return match item.and_then(|id| self.item(id)).map(|i| &i.kind) {
-                        Some(Kind::Widget { .. }) => HomeAction::TapWidget(pos),
+                        Some(Kind::Widget { .. }) => HomeAction::TapWidget { pos, touch_id },
                         Some(Kind::Icon { exec, .. }) => HomeAction::Launch(exec.clone()),
                         None => HomeAction::None,
                     };
@@ -620,7 +640,13 @@ impl Home {
     }
 
     fn tick_long_press(&mut self) -> HomeAction {
-        let Gesture::Pending { start, t0, item } = self.gesture else {
+        let Gesture::Pending {
+            start,
+            t0,
+            item,
+            ..
+        } = self.gesture
+        else {
             return HomeAction::None;
         };
         let Some(id) = item else {

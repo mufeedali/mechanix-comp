@@ -86,10 +86,6 @@ impl Backend for MechaData {
     fn placement(&self, surface: &WlSurface) -> Option<Rectangle<i32, Logical>> {
         self.home.placement(surface)
     }
-
-    fn visible_surfaces(&self) -> Option<Vec<WlSurface>> {
-        Some(self.home.visible_surfaces())
-    }
 }
 
 impl Drop for MechaData {
@@ -202,6 +198,7 @@ impl Homescreen {
                 },
                 touch_config: None,
                 gesture_config: None,
+                color_texture: true,
             },
             Div::new(Default::default(), ()),
         );
@@ -331,7 +328,9 @@ impl Homescreen {
         let action = {
             let home = &mut self.nest.state.backend_data.home;
             match ev {
-                WlTouchEvent::Down { x, y, .. } => home.pointer_down((*x as f64, *y as f64).into()),
+                WlTouchEvent::Down { id, x, y, .. } => {
+                    home.touch_down((*x as f64, *y as f64).into(), *id)
+                }
                 WlTouchEvent::Motion { x, y, .. } => home.pointer_move((*x as f64, *y as f64).into()),
                 WlTouchEvent::Up { .. } | WlTouchEvent::Cancel { .. } => {
                     home.pointer_up(home.last_pos())
@@ -640,8 +639,12 @@ fn apply_home_action(state: &mut State<MechaData>, action: HomeAction) {
             raise_lifted(state);
             state.schedule_render();
         }
-        HomeAction::TapWidget(pos) => {
-            tap_widget(state, pos);
+        HomeAction::TapWidget { pos, touch_id } => {
+            if let Some(id) = touch_id {
+                tap_widget_touch(state, pos, id);
+            } else {
+                tap_widget_pointer(state, pos);
+            }
             state.schedule_render();
         }
         HomeAction::Launch(exec) => state.backend_data.home.launch(&exec),
@@ -674,18 +677,32 @@ fn apply_home_action(state: &mut State<MechaData>, action: HomeAction) {
     }
 }
 
-fn tap_widget(state: &mut State<MechaData>, pos: Point<f64, Logical>) {
-    let serial = SERIAL_COUNTER.next_serial();
+fn nest_under(
+    state: &State<MechaData>,
+    pos: Point<f64, Logical>,
+) -> (
+    Option<Window>,
+    Option<(
+        WlSurface,
+        Point<f64, Logical>,
+    )>,
+) {
     let window = nest_window_at(state, pos);
-    if let Some(window) = window.as_ref() {
-        state.focus_window(window, serial);
-    }
-    let under = window.and_then(|window| {
-        let loc = state.space.element_location(&window)?;
+    let under = window.as_ref().and_then(|window| {
+        let loc = state.space.element_location(window)?;
         window
             .surface_under(pos - loc.to_f64(), WindowSurfaceType::ALL)
             .map(|(surface, local)| (surface, (local + loc).to_f64()))
     });
+    (window, under)
+}
+
+fn tap_widget_pointer(state: &mut State<MechaData>, pos: Point<f64, Logical>) {
+    let serial = SERIAL_COUNTER.next_serial();
+    let (window, under) = nest_under(state, pos);
+    if let Some(window) = window.as_ref() {
+        state.focus_window(window, serial);
+    }
     let pointer = state.pointer.clone();
     pointer.motion(
         state,
@@ -715,4 +732,36 @@ fn tap_widget(state: &mut State<MechaData>, pos: Point<f64, Logical>) {
         },
     );
     pointer.frame(state);
+}
+
+fn tap_widget_touch(state: &mut State<MechaData>, pos: Point<f64, Logical>, id: i32) {
+    let Some(touch) = state.seat.get_touch() else {
+        tap_widget_pointer(state, pos);
+        return;
+    };
+    let serial = SERIAL_COUNTER.next_serial();
+    let (window, under) = nest_under(state, pos);
+    if let Some(window) = window.as_ref() {
+        state.focus_window(window, serial);
+    }
+    let slot = smithay::backend::input::TouchSlot::from(u32::try_from(id).ok());
+    touch.down(
+        state,
+        under,
+        &smithay::input::touch::DownEvent {
+            slot,
+            location: pos,
+            serial,
+            time: 0,
+        },
+    );
+    touch.up(
+        state,
+        &smithay::input::touch::UpEvent {
+            slot,
+            serial: SERIAL_COUNTER.next_serial(),
+            time: 0,
+        },
+    );
+    touch.frame(state);
 }
