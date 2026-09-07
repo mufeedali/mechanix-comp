@@ -8,11 +8,10 @@ members = [".", "homescreen"]
 exclude = ["vendor"]
 
 [features]
-default = ["session", "backend-udev", "backend-winit"]
-# Clipboard, lock, foreign-toplevel, IME, vkbd, idle, output-power, activation.
+default = ["session"]
+# Clipboard, lock, foreign-toplevel, IME, vkbd, idle, output-power, activation,
+# and the udev/winit output backends.
 session = []
-backend-udev = []
-backend-winit = []
 
 [dependencies.smithay]
 git = "https://github.com/mecha-org/smithay"

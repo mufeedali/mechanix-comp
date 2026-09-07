@@ -3,9 +3,9 @@ use smithay::output::Output;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::{Physical, Size, Transform};
 
-#[cfg(feature = "backend-udev")]
+#[cfg(feature = "session")]
 pub mod udev;
-#[cfg(feature = "backend-winit")]
+#[cfg(feature = "session")]
 pub mod winit;
 
 /// 2x only for clearly HiDPI panels: tall enough, real physical size, >192 DPI on both axes.

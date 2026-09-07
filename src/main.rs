@@ -1,4 +1,3 @@
-#[cfg(any(feature = "backend-winit", feature = "backend-udev"))]
 use compositor::backend;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -16,23 +15,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     if use_winit {
-        #[cfg(feature = "backend-winit")]
-        {
-            backend::winit::run()
-        }
-        #[cfg(not(feature = "backend-winit"))]
-        {
-            Err("winit backend not compiled (enable feature backend-winit)".into())
-        }
+        backend::winit::run()
     } else {
-        #[cfg(feature = "backend-udev")]
-        {
-            backend::udev::run()
-        }
-        #[cfg(not(feature = "backend-udev"))]
-        {
-            Err("udev backend not compiled (enable feature backend-udev)".into())
-        }
+        backend::udev::run()
     }
 }
 
