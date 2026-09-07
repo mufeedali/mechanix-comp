@@ -30,7 +30,7 @@ use crate::state::State;
 use smithay::desktop::PopupKind;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 
-smithay::delegate_dispatch2!(@<BackendData: Backend + 'static> crate::state::State<BackendData>);
+smithay::delegate_dispatch2!(@<BackendData: Backend + 'static> State<BackendData>);
 
 impl<BackendData: Backend + 'static> State<BackendData> {
     /// One commit-time entry point from `CompositorHandler::commit`: routes the

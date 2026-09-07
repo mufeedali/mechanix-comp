@@ -291,6 +291,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 state.backend_data.backend.submit(Some(&[damage])).unwrap();
 
                 state.send_frame_callbacks(&output);
+                state.confirm_pending_lock();
 
                 state.backend_data.backend.window().request_redraw();
             }
@@ -307,6 +308,8 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     event_loop.run(None, &mut state, move |state| {
         state.on_idle();
+        state.foreign_toplevel_refresh();
+        state.update_idle_inhibit();
     })?;
 
     Ok(())

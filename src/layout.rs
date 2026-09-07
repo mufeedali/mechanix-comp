@@ -130,6 +130,9 @@ impl<BackendData: Backend + 'static> State<BackendData> {
 
     /// Size, position, xdg state, and Space z-order from the layout model.
     pub fn apply_layout(&mut self, output: &Output) {
+        if !self.is_session() {
+            return;
+        }
         let zone = layer_map_for_output(output).non_exclusive_zone();
         if let Some(focused) = self.active_window.clone() {
             let group = ancestor_chain(&focused, |s| self.parent_of(s));
@@ -154,15 +157,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
             }
 
             let dialog = is_dialog(toplevel);
-            let placement = if let Some(geo) = self.backend_data.placement(surface) {
-                Placement {
-                    loc: geo.loc,
-                    size: Some(geo.size),
-                    bounds: None,
-                    maximized: true,
-                    reported: WindowMode::Maximized,
-                }
-            } else if dialog {
+            let placement = if dialog {
                 let loc = toplevel
                     .parent()
                     .and_then(|parent| self.window_for(&parent))
@@ -231,9 +226,6 @@ impl<BackendData: Backend + 'static> State<BackendData> {
 
     /// The active group's surfaces that are stacked on `output`.
     pub fn visible_surfaces(&self, output: &Output) -> HashSet<WlSurface> {
-        if let Some(list) = self.backend_data.visible_surfaces() {
-            return list.into_iter().collect();
-        }
         let Some(layout) = self.layouts.get(output) else {
             return HashSet::new();
         };

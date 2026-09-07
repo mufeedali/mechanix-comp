@@ -38,6 +38,7 @@ enum Kind {
         surface: Option<WlSurface>,
         child: Option<Child>,
         launch_failed: bool,
+        ever_mapped: bool,
     },
     Icon {
         desktop: String,
@@ -92,8 +93,6 @@ enum Gesture {
         start: Point<f64, Logical>,
         t0: Instant,
         item: Option<ItemId>,
-        /// `Some` if this contact is a finger (`wl_touch` id).
-        touch_id: Option<i32>,
     },
     Swipe {
         start_x: f64,
@@ -122,10 +121,14 @@ pub enum HomeAction {
     /// Move the lifted surface in Space only — no xdg configure.
     Relocate,
     Relayout,
-    TapWidget {
+    PointerClick {
         pos: Point<f64, Logical>,
-        /// Nest `wl_touch` slot. `None` is a nest pointer click.
-        touch_id: Option<i32>,
+    },
+    /// Stream a finger into the nest. Swipe/lift steal with `Cancel`.
+    Touch {
+        id: i32,
+        pos: Point<f64, Logical>,
+        phase: TouchPhase,
     },
     Launch(String),
     CloseSurface(WlSurface),
@@ -133,6 +136,13 @@ pub enum HomeAction {
     Reload {
         close: Vec<WlSurface>,
     },
+}
+
+#[derive(Clone, Copy)]
+pub enum TouchPhase {
+    Down,
+    Motion,
+    Up,
 }
 
 pub struct Home {
@@ -154,6 +164,10 @@ pub struct Home {
     frame_preview: Option<Rectangle<i32, Logical>>,
     page_edge: Option<(i32, Instant)>,
     wait: Option<Duration>,
+    /// Nest `wl_touch` slot we are streaming. Pointer never sets this.
+    touch_grab: Option<i32>,
+    /// Grab to cancel before the next nest action (swipe / lift / host cancel).
+    touch_steal: Option<i32>,
 }
 
 impl Home {
@@ -177,6 +191,7 @@ impl Home {
                     surface: None,
                     child: None,
                     launch_failed: false,
+                    ever_mapped: false,
                 },
             });
             next_id += 1;
@@ -219,6 +234,8 @@ impl Home {
             frame_preview: None,
             page_edge: None,
             wait: None,
+            touch_grab: None,
+            touch_steal: None,
         };
         home.compact_pages();
         Ok(home)
@@ -308,7 +325,7 @@ impl Home {
         for item in &mut self.items {
             let Kind::Widget {
                 child,
-                surface,
+                ever_mapped,
                 launch_failed,
                 ..
             } = &mut item.kind
@@ -322,7 +339,7 @@ impl Home {
                 continue;
             };
             *child = None;
-            if surface.is_none() {
+            if !*ever_mapped {
                 *launch_failed = true;
                 warn!(?status, "widget exited before creating a surface");
             }
@@ -339,12 +356,24 @@ impl Home {
         if let Kind::Widget {
             command,
             surface: slot,
+            ever_mapped,
             ..
         } = &mut item.kind
         {
             info!(cmd = %command, "claimed nest toplevel for slot");
             *slot = Some(surface.clone());
+            *ever_mapped = true;
         }
+    }
+
+    pub fn mapped_widgets(&self) -> Vec<WlSurface> {
+        self.items
+            .iter()
+            .filter_map(|i| match &i.kind {
+                Kind::Widget { surface, .. } => surface.clone(),
+                Kind::Icon { .. } => None,
+            })
+            .collect()
     }
 
     pub fn release(&mut self, surface: &WlSurface) {
@@ -357,9 +386,9 @@ impl Home {
         }
     }
 
-    /// Nest placement. A lifted widget follows the pointer; everything else
+    /// Slot rectangle. A lifted widget follows the pointer; everything else
     /// sits on its current grid cell (the hole, once reflow has run).
-    pub fn placement(&self, surface: &WlSurface) -> Option<Rectangle<i32, Logical>> {
+    pub fn slot_rect(&self, surface: &WlSurface) -> Option<Rectangle<i32, Logical>> {
         let item = self.items.iter().find(|i| i.owns_surface(surface))?;
         if self.lifted() == Some(item.id) {
             return Some(self.lift_rect(item.id));
@@ -367,7 +396,7 @@ impl Home {
         Some(self.item_rect(item.id))
     }
 
-    pub fn visible_surfaces(&self) -> Vec<WlSurface> {
+    pub fn widgets_on_screen(&self) -> Vec<WlSurface> {
         self.items
             .iter()
             .filter(|i| self.page_nearby(i.cells.page))
@@ -494,6 +523,9 @@ impl Home {
     }
 
     fn contact_down(&mut self, pos: Point<f64, Logical>, touch_id: Option<i32>) -> HomeAction {
+        if !matches!(self.gesture, Gesture::Idle) {
+            return HomeAction::None;
+        }
         self.last_pos = pos;
         self.settle = None;
         if let Some(id) = self.hit_close(pos) {
@@ -519,16 +551,26 @@ impl Home {
         {
             return self.start_lift(id, pos);
         }
+        let nest_touch =
+            touch_id.filter(|_| item.is_some_and(|id| self.item(id).is_some_and(Item::is_widget)));
+        self.touch_grab = nest_touch;
         self.gesture = Gesture::Pending {
             start: pos,
             t0: Instant::now(),
             item,
-            touch_id,
         };
         if item.is_some() {
             self.wait = Some(LONG_PRESS);
         }
-        HomeAction::None
+        if let Some(id) = nest_touch {
+            HomeAction::Touch {
+                id,
+                pos,
+                phase: TouchPhase::Down,
+            }
+        } else {
+            HomeAction::None
+        }
     }
 
     pub fn pointer_move(&mut self, pos: Point<f64, Logical>) -> HomeAction {
@@ -540,6 +582,7 @@ impl Home {
                 if dx.abs() > SLOP && dx.abs() > dy.abs() && !self.edit {
                     let origin_page = self.page();
                     let carry = self.page_drag;
+                    self.steal_touch();
                     self.gesture = Gesture::Swipe {
                         start_x: start.x,
                         origin_page,
@@ -550,6 +593,13 @@ impl Home {
                     };
                     self.page_drag = self.swipe_delta(dx + carry, origin_page);
                     return HomeAction::Relocate;
+                }
+                if let Some(id) = self.touch_grab {
+                    return HomeAction::Touch {
+                        id,
+                        pos,
+                        phase: TouchPhase::Motion,
+                    };
                 }
                 HomeAction::None
             }
@@ -593,12 +643,7 @@ impl Home {
     pub fn pointer_up(&mut self, pos: Point<f64, Logical>) -> HomeAction {
         let g = std::mem::replace(&mut self.gesture, Gesture::Idle);
         match g {
-            Gesture::Pending {
-                start,
-                t0,
-                item,
-                touch_id,
-            } => {
+            Gesture::Pending { start, t0, item } => {
                 let dt = Instant::now().saturating_duration_since(t0);
                 let dist = (pos.x - start.x).hypot(pos.y - start.y);
                 if dt >= LONG_PRESS
@@ -621,11 +666,22 @@ impl Home {
                         }
                     }
                     return match item.and_then(|id| self.item(id)).map(|i| &i.kind) {
-                        Some(Kind::Widget { .. }) => HomeAction::TapWidget { pos, touch_id },
+                        Some(Kind::Widget { .. }) => {
+                            if let Some(id) = self.touch_grab.take() {
+                                HomeAction::Touch {
+                                    id,
+                                    pos,
+                                    phase: TouchPhase::Up,
+                                }
+                            } else {
+                                HomeAction::PointerClick { pos }
+                            }
+                        }
                         Some(Kind::Icon { exec, .. }) => HomeAction::Launch(exec.clone()),
                         None => HomeAction::None,
                     };
                 }
+                self.steal_touch();
                 HomeAction::None
             }
             Gesture::Swipe {
@@ -688,6 +744,40 @@ impl Home {
         self.wait.take()
     }
 
+    pub fn take_touch_steal(&mut self) -> Option<i32> {
+        self.touch_steal.take()
+    }
+
+    fn steal_touch(&mut self) {
+        if let Some(id) = self.touch_grab.take() {
+            self.touch_steal = Some(id);
+        }
+    }
+
+    /// Host compositor cancelled the finger (not a tap).
+    pub fn touch_cancel(&mut self) -> HomeAction {
+        self.steal_touch();
+        let g = std::mem::replace(&mut self.gesture, Gesture::Idle);
+        match g {
+            Gesture::Lifted { .. } | Gesture::Resizing { .. } => {
+                self.restore_snapshot();
+                self.frame_preview = None;
+                self.drag_snapshot = None;
+                self.page_edge = None;
+                self.pages.end_lift();
+                self.compact_pages();
+                HomeAction::Relayout
+            }
+            Gesture::Swipe { origin_page, .. } => {
+                self.set_page(origin_page);
+                self.page_drag = 0.0;
+                self.settle = None;
+                HomeAction::Relocate
+            }
+            Gesture::Pending { .. } | Gesture::Idle => HomeAction::None,
+        }
+    }
+
     fn tick_long_press(&mut self) -> HomeAction {
         let Gesture::Pending {
             start, t0, item, ..
@@ -739,6 +829,7 @@ impl Home {
     }
 
     fn start_lift(&mut self, id: ItemId, start: Point<f64, Logical>) -> HomeAction {
+        self.steal_touch();
         self.enter_edit(id);
         self.pages.begin_lift(self.page_count());
         self.begin_drag();
@@ -1089,6 +1180,7 @@ impl Home {
                         surface: None,
                         child: None,
                         launch_failed: false,
+                        ever_mapped: false,
                     },
                 });
                 next_id += 1;
@@ -1323,6 +1415,7 @@ mod tests {
                 surface: None,
                 child: None,
                 launch_failed: false,
+                ever_mapped: false,
             },
         }
     }
@@ -1346,6 +1439,8 @@ mod tests {
             frame_preview: None,
             page_edge: None,
             wait: None,
+            touch_grab: None,
+            touch_steal: None,
         }
     }
 

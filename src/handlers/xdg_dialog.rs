@@ -14,5 +14,3 @@ impl<BackendData: Backend + 'static> XdgDialogHandler for State<BackendData> {
         }
     }
 }
-
-

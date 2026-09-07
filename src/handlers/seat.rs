@@ -47,7 +47,7 @@ impl<BackendData: Backend + 'static> SeatHandler for State<BackendData> {
     }
 }
 
-impl<BackendData: Backend> PointerConstraintsHandler for State<BackendData> {
+impl<BackendData: Backend + 'static> PointerConstraintsHandler for State<BackendData> {
     fn new_constraint(&mut self, surface: &WlSurface, pointer: &PointerHandle<Self>) {
         // XXX region
         let Some(current_focus) = pointer.current_focus() else {
@@ -117,7 +117,7 @@ impl<BackendData: Backend> PointerConstraintsHandler for State<BackendData> {
 }
 
 #[cfg(feature = "session")]
-impl<BackendData: Backend> InputMethodHandler for State<BackendData> {
+impl<BackendData: Backend + 'static> InputMethodHandler for State<BackendData> {
     fn new_popup(&mut self, surface: PopupSurface) {
         if let Err(err) = self.popups.track_popup(PopupKind::from(surface)) {
             warn!("Failed to track popup: {}", err);
@@ -142,6 +142,6 @@ impl<BackendData: Backend> InputMethodHandler for State<BackendData> {
     }
 }
 
-impl<BackendData: Backend> TabletSeatHandler for State<BackendData> {
+impl<BackendData: Backend + 'static> TabletSeatHandler for State<BackendData> {
     type ToolFocus = WlSurface;
 }

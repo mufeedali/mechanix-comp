@@ -19,7 +19,10 @@ use smithay::utils::Transform;
 use timer::{Relative, Timer, TimerEvent, TimerId};
 use tracing::info;
 use ui::widgets::Div;
-use wayland::{WlPointerButtonState, WlPointerEvent, WlTouchEvent, ZwlrLayerSurfaceV1Event};
+use wayland::{
+    WlKeyboardEvent, WlKeyboardKeyState, WlPointerButtonState, WlPointerEvent, WlTouchEvent,
+    ZwlrLayerSurfaceV1Event,
+};
 use window_manager::{
     WindowHandle, WindowKind, WindowManager, WindowSettings, ZwlrLayerShellV1Layer,
     ZwlrLayerSurfaceV1Anchor, ZwlrLayerSurfaceV1KeyboardInteractivity,
@@ -28,11 +31,11 @@ use window_manager::{
 use crate::chrome::Fill;
 use crate::config::ConfigWatch;
 use crate::home::HomeAction;
-use crate::nest::{MechaData, Nest, apply_home_action, nest_elements, nest_gl_from_current};
+use crate::nest::{
+    Nest, NestBackend, NestKeyboard, apply_home_action, nest_elements, nest_gl_from_current,
+};
 
 const CLEAR: [f32; 4] = [0.1, 0.1, 0.1, 1.0];
-
-type Chrome = Div<()>;
 
 #[derive(State)]
 struct Homescreen {
@@ -40,9 +43,11 @@ struct Homescreen {
     wm: WindowManager,
     timer: Timer,
     #[lens(skip)]
-    layer: WindowHandle<Chrome>,
+    layer: WindowHandle<Div<()>>,
     #[lens(skip)]
     nest: Nest,
+    #[lens(skip)]
+    keys: NestKeyboard,
     #[lens(skip)]
     quit: bool,
     #[lens(skip)]
@@ -78,7 +83,7 @@ impl Homescreen {
                         | ZwlrLayerSurfaceV1Anchor::Right,
                     exclusive_zone: -1,
                     namespace: "mechanix-home".into(),
-                    keyboard_interactivity: ZwlrLayerSurfaceV1KeyboardInteractivity::None,
+                    keyboard_interactivity: ZwlrLayerSurfaceV1KeyboardInteractivity::OnDemand,
                 },
                 touch_config: None,
                 gesture_config: None,
@@ -100,6 +105,7 @@ impl Homescreen {
             timer,
             layer,
             nest,
+            keys: NestKeyboard::new(),
             quit: false,
             nest_token: None,
             nest_readable: false,
@@ -195,6 +201,25 @@ impl Homescreen {
         self.apply(action);
     }
 
+    fn on_keyboard(&mut self, ev: &WlKeyboardEvent) {
+        match ev {
+            WlKeyboardEvent::Enter { keys, .. } => {
+                self.keys.enter(&mut self.nest.state, keys);
+            }
+            WlKeyboardEvent::Leave { .. } => self.keys.leave(&mut self.nest.state),
+            WlKeyboardEvent::Key { key, state, .. } => match state {
+                WlKeyboardKeyState::Pressed => {
+                    self.keys.key(&mut self.nest.state, *key, true);
+                }
+                WlKeyboardKeyState::Released => {
+                    self.keys.key(&mut self.nest.state, *key, false);
+                }
+                WlKeyboardKeyState::Repeated => {}
+            },
+            _ => {}
+        }
+    }
+
     fn on_touch(&mut self, ev: &WlTouchEvent) {
         let action = {
             let home = &mut self.nest.state.backend_data.home;
@@ -205,9 +230,8 @@ impl Homescreen {
                 WlTouchEvent::Motion { x, y, .. } => {
                     home.pointer_move((*x as f64, *y as f64).into())
                 }
-                WlTouchEvent::Up { .. } | WlTouchEvent::Cancel { .. } => {
-                    home.pointer_up(home.last_pos())
-                }
+                WlTouchEvent::Up { .. } => home.pointer_up(home.last_pos()),
+                WlTouchEvent::Cancel { .. } => home.touch_cancel(),
                 _ => return,
             }
         };
@@ -249,16 +273,17 @@ impl Homescreen {
             output
         } else {
             let output = Output::new(
-                "homescreen".to_string(),
+                "nest".to_string(),
                 PhysicalProperties {
                     size: (0, 0).into(),
                     subpixel: Subpixel::Unknown,
                     make: "mechanix".into(),
-                    model: "homescreen".into(),
+                    model: "nest".into(),
                     serial_number: "0".into(),
                 },
             );
-            let _global = output.create_global::<State<MechaData>>(&self.nest.state.display_handle);
+            let _global =
+                output.create_global::<State<NestBackend>>(&self.nest.state.display_handle);
             output.change_current_state(
                 Some(mode),
                 Some(Transform::Normal),
@@ -384,6 +409,7 @@ fn module<S>() -> impl app::RegisteredModule<Homescreen, S> {
     Module::new()
         .on(|s: &mut Homescreen, ev: &ZwlrLayerSurfaceV1Event| s.on_layer(ev))
         .on(|s: &mut Homescreen, ev: &WlPointerEvent| s.on_pointer(ev))
+        .on(|s: &mut Homescreen, ev: &WlKeyboardEvent| s.on_keyboard(ev))
         .on(|s: &mut Homescreen, ev: &WlTouchEvent| s.on_touch(ev))
         .on(|s: &mut Homescreen, ev: &IoEvent| s.on_io(ev))
         .on(|s: &mut Homescreen, ev: &TimerEvent| s.on_timer(ev))

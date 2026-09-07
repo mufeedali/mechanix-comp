@@ -1,11 +1,12 @@
-//! In-process Smithay nest: socket, backend, tile crop, tap inject.
+//! In-process Smithay nest: socket, backend, tile crop, nest seat inject.
 
+use std::collections::HashSet;
 use std::time::Duration;
 
 use compositor::backend::Backend;
 use compositor::state::{SocketName, State};
 use smithay::backend::egl::EGLContext;
-use smithay::backend::input::ButtonState;
+use smithay::backend::input::{ButtonState, InputTime, KeyState, Keycode};
 use smithay::backend::renderer::ImportDma;
 use smithay::backend::renderer::damage::OutputDamageTracker;
 use smithay::backend::renderer::element::AsRenderElements;
@@ -13,6 +14,7 @@ use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
 use smithay::backend::renderer::element::utils::CropRenderElement;
 use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
 use smithay::desktop::{Window, WindowSurfaceType};
+use smithay::input::keyboard::FilterResult;
 use smithay::input::pointer::MotionEvent;
 use smithay::output::Output;
 use smithay::reexports::calloop::EventLoop;
@@ -21,9 +23,9 @@ use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::{Logical, Point, Rectangle, SERIAL_COUNTER};
 use tracing::info;
 
-use crate::home::{Home, HomeAction};
+use crate::home::{Home, HomeAction, TouchPhase};
 
-pub(crate) struct MechaData {
+pub(crate) struct NestBackend {
     pub nest_gl: GlesRenderer,
     pub damage_tracker: Option<OutputDamageTracker>,
     pub pending_render: bool,
@@ -31,13 +33,13 @@ pub(crate) struct MechaData {
     pub slot_tex: Option<GlesTexture>,
 }
 
-impl Backend for MechaData {
+impl Backend for NestBackend {
     fn renderer(&mut self) -> &mut GlesRenderer {
         &mut self.nest_gl
     }
 
     fn seat_name(&self) -> String {
-        "homescreen".to_string()
+        "nest".to_string()
     }
 
     fn reset_buffers(&mut self, _output: &Output) {}
@@ -45,21 +47,9 @@ impl Backend for MechaData {
     fn schedule_render(&mut self, _output: &Output) {
         self.pending_render = true;
     }
-
-    fn on_new_toplevel(&mut self, surface: &WlSurface) {
-        self.home.claim(surface);
-    }
-
-    fn on_unmapped(&mut self, surface: &WlSurface) {
-        self.home.release(surface);
-    }
-
-    fn placement(&self, surface: &WlSurface) -> Option<Rectangle<i32, Logical>> {
-        self.home.placement(surface)
-    }
 }
 
-impl Drop for MechaData {
+impl Drop for NestBackend {
     fn drop(&mut self) {
         if let Some(tex) = self.slot_tex.take() {
             std::mem::forget(tex);
@@ -68,25 +58,25 @@ impl Drop for MechaData {
 }
 
 pub(crate) struct Nest {
-    pub event_loop: EventLoop<'static, State<MechaData>>,
-    pub state: State<MechaData>,
+    pub event_loop: EventLoop<'static, State<NestBackend>>,
+    pub state: State<NestBackend>,
 }
 
 impl Nest {
     pub fn new(nest_gl: GlesRenderer) -> Result<Self, Box<dyn std::error::Error>> {
-        let mut event_loop: EventLoop<State<MechaData>> = EventLoop::try_new()?;
-        let display: Display<State<MechaData>> = Display::new()?;
+        let mut event_loop: EventLoop<State<NestBackend>> = EventLoop::try_new()?;
+        let display: Display<State<NestBackend>> = Display::new()?;
         let mut state = State::new_with_socket(
             &mut event_loop,
             display,
-            MechaData {
+            NestBackend {
                 nest_gl,
                 damage_tracker: None,
                 pending_render: false,
                 home: Home::load()?,
                 slot_tex: None,
             },
-            SocketName::Widget,
+            SocketName::Nest,
         );
         state.seat.add_touch();
         state.backend_data.home.pump_spawns(&state.socket_name);
@@ -94,7 +84,7 @@ impl Nest {
         let dmabuf_formats = state.backend_data.renderer().dmabuf_formats();
         let dmabuf_global = state
             .dmabuf_state
-            .create_global::<State<MechaData>>(&state.display_handle, dmabuf_formats);
+            .create_global::<State<NestBackend>>(&state.display_handle, dmabuf_formats);
         state.dmabuf_global = Some(dmabuf_global);
 
         info!(
@@ -110,7 +100,12 @@ impl Nest {
     }
 
     pub fn idle(&mut self) {
-        self.state.on_idle();
+        let dropped = self.state.on_idle();
+        for surface in &dropped {
+            self.state.backend_data.home.release(surface);
+        }
+        sync_claims(&mut self.state);
+        configure_slots(&mut self.state);
         self.state.backend_data.home.reap();
         self.state
             .backend_data
@@ -143,7 +138,7 @@ pub(crate) fn nest_gl_from_current() -> Result<GlesRenderer, Box<dyn std::error:
 }
 
 pub(crate) fn nest_elements(
-    state: &mut State<MechaData>,
+    state: &mut State<NestBackend>,
     output: &Output,
 ) -> Vec<CropRenderElement<WaylandSurfaceRenderElement<GlesRenderer>>> {
     let scale = output.current_scale().fractional_scale();
@@ -155,10 +150,10 @@ pub(crate) fn nest_elements(
     let tiles: Vec<_> = state
         .backend_data
         .home
-        .visible_surfaces()
+        .widgets_on_screen()
         .into_iter()
         .filter_map(|surface| {
-            let clip = state.backend_data.home.placement(&surface)?;
+            let clip = state.backend_data.home.slot_rect(&surface)?;
             let ws = state.toplevels.get(&surface)?;
             let loc = state.space.element_location(&ws.window)?;
             Some((
@@ -187,13 +182,16 @@ pub(crate) fn nest_elements(
     elements
 }
 
-pub(crate) fn apply_home_action(state: &mut State<MechaData>, action: HomeAction) {
+pub(crate) fn apply_home_action(state: &mut State<NestBackend>, action: HomeAction) {
+    if let Some(id) = state.backend_data.home.take_touch_steal() {
+        nest_touch_cancel(state, id);
+    }
     match action {
         HomeAction::None => {}
         HomeAction::Redraw => state.schedule_render(),
         HomeAction::Relocate => {
-            for surface in state.backend_data.home.visible_surfaces() {
-                let Some(geo) = state.backend_data.home.placement(&surface) else {
+            for surface in state.backend_data.home.widgets_on_screen() {
+                let Some(geo) = state.backend_data.home.slot_rect(&surface) else {
                     continue;
                 };
                 let Some(ws) = state.toplevels.get(&surface) else {
@@ -205,17 +203,18 @@ pub(crate) fn apply_home_action(state: &mut State<MechaData>, action: HomeAction
             state.schedule_render();
         }
         HomeAction::Relayout => {
-            if let Some(output) = state.primary_output() {
-                state.apply_layout(&output);
-            }
-            raise_lifted(state);
+            configure_slots(state);
             state.schedule_render();
         }
-        HomeAction::TapWidget { pos, touch_id } => {
-            if let Some(id) = touch_id {
-                tap_widget_touch(state, pos, id);
-            } else {
-                tap_widget_pointer(state, pos);
+        HomeAction::PointerClick { pos } => {
+            tap_widget_pointer(state, pos);
+            state.schedule_render();
+        }
+        HomeAction::Touch { id, pos, phase } => {
+            match phase {
+                TouchPhase::Down => nest_touch_down(state, pos, id),
+                TouchPhase::Motion => nest_touch_motion(state, pos, id),
+                TouchPhase::Up => nest_touch_up(state, pos, id),
             }
             state.schedule_render();
         }
@@ -240,16 +239,65 @@ pub(crate) fn apply_home_action(state: &mut State<MechaData>, action: HomeAction
                     toplevel.send_close();
                 }
             }
-            if let Some(output) = state.primary_output() {
-                state.apply_layout(&output);
-            }
-            raise_lifted(state);
+            sync_claims(state);
+            configure_slots(state);
             state.schedule_render();
         }
     }
 }
 
-fn nest_window_at(state: &State<MechaData>, pos: Point<f64, Logical>) -> Option<Window> {
+fn sync_claims(state: &mut State<NestBackend>) {
+    let live: HashSet<WlSurface> = state.toplevels.keys().cloned().collect();
+    for surface in &live {
+        state.backend_data.home.claim(surface);
+    }
+    for surface in state.backend_data.home.mapped_widgets() {
+        if !live.contains(&surface) {
+            state.backend_data.home.release(&surface);
+        }
+    }
+}
+
+fn configure_slots(state: &mut State<NestBackend>) {
+    for surface in state.backend_data.home.widgets_on_screen() {
+        let Some(geo) = state.backend_data.home.slot_rect(&surface) else {
+            continue;
+        };
+        let Some(ws) = state.toplevels.get(&surface) else {
+            continue;
+        };
+        let Some(toplevel) = ws.window.toplevel().cloned() else {
+            continue;
+        };
+        let window = ws.window.clone();
+        let mapped = ws.mapped;
+        toplevel.with_pending_state(|pending| {
+            pending.size = Some(geo.size);
+            pending.states.set(
+                smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::State::Maximized,
+            );
+        });
+        if toplevel.is_initial_configure_sent() {
+            toplevel.send_pending_configure();
+        } else {
+            toplevel.send_configure();
+        }
+        if mapped {
+            state.space.relocate_element(&window, geo.loc);
+        } else {
+            state.space.map_element(window.clone(), geo.loc, false);
+            if let Some(ws) = state.toplevels.get_mut(&surface) {
+                ws.mapped = true;
+            }
+            if state.active_fullscreen_window().is_none() {
+                state.focus_window(&window, SERIAL_COUNTER.next_serial());
+            }
+        }
+    }
+    raise_lifted(state);
+}
+
+fn nest_window_at(state: &State<NestBackend>, pos: Point<f64, Logical>) -> Option<Window> {
     let p = (pos.x.round() as i32, pos.y.round() as i32);
     for window in state.space.elements().rev() {
         let Some(surface) = window.toplevel().map(|t| t.wl_surface().clone()) else {
@@ -258,7 +306,7 @@ fn nest_window_at(state: &State<MechaData>, pos: Point<f64, Logical>) -> Option<
         if state
             .backend_data
             .home
-            .placement(&surface)
+            .slot_rect(&surface)
             .is_some_and(|geo| geo.contains(p))
         {
             return Some(window.clone());
@@ -267,7 +315,7 @@ fn nest_window_at(state: &State<MechaData>, pos: Point<f64, Logical>) -> Option<
     None
 }
 
-fn raise_lifted(state: &mut State<MechaData>) {
+fn raise_lifted(state: &mut State<NestBackend>) {
     if let Some(surface) = state.backend_data.home.lifted_surface()
         && let Some(ws) = state.toplevels.get(&surface)
     {
@@ -277,7 +325,7 @@ fn raise_lifted(state: &mut State<MechaData>) {
 
 type NestHit = (Option<Window>, Option<(WlSurface, Point<f64, Logical>)>);
 
-fn nest_under(state: &State<MechaData>, pos: Point<f64, Logical>) -> NestHit {
+fn nest_under(state: &State<NestBackend>, pos: Point<f64, Logical>) -> NestHit {
     let window = nest_window_at(state, pos);
     let under = window.as_ref().and_then(|window| {
         let loc = state.space.element_location(window)?;
@@ -288,7 +336,7 @@ fn nest_under(state: &State<MechaData>, pos: Point<f64, Logical>) -> NestHit {
     (window, under)
 }
 
-fn tap_widget_pointer(state: &mut State<MechaData>, pos: Point<f64, Logical>) {
+fn tap_widget_pointer(state: &mut State<NestBackend>, pos: Point<f64, Logical>) {
     let serial = SERIAL_COUNTER.next_serial();
     let (window, under) = nest_under(state, pos);
     if let Some(window) = window.as_ref() {
@@ -325,9 +373,8 @@ fn tap_widget_pointer(state: &mut State<MechaData>, pos: Point<f64, Logical>) {
     pointer.frame(state);
 }
 
-fn tap_widget_touch(state: &mut State<MechaData>, pos: Point<f64, Logical>, id: i32) {
+fn nest_touch_down(state: &mut State<NestBackend>, pos: Point<f64, Logical>, id: i32) {
     let Some(touch) = state.seat.get_touch() else {
-        tap_widget_pointer(state, pos);
         return;
     };
     let serial = SERIAL_COUNTER.next_serial();
@@ -335,24 +382,115 @@ fn tap_widget_touch(state: &mut State<MechaData>, pos: Point<f64, Logical>, id: 
     if let Some(window) = window.as_ref() {
         state.focus_window(window, serial);
     }
-    let slot = smithay::backend::input::TouchSlot::from(u32::try_from(id).ok());
     touch.down(
         state,
         under,
         &smithay::input::touch::DownEvent {
-            slot,
+            slot: touch_slot(id),
             location: pos,
             serial,
             time: smithay::backend::input::InputTime::now(),
         },
     );
+    touch.frame(state);
+}
+
+fn nest_touch_motion(state: &mut State<NestBackend>, pos: Point<f64, Logical>, id: i32) {
+    let Some(touch) = state.seat.get_touch() else {
+        return;
+    };
+    let (_, under) = nest_under(state, pos);
+    touch.motion(
+        state,
+        under,
+        &smithay::input::touch::MotionEvent {
+            slot: touch_slot(id),
+            location: pos,
+            time: smithay::backend::input::InputTime::now(),
+        },
+    );
+    touch.frame(state);
+}
+
+fn nest_touch_up(state: &mut State<NestBackend>, _pos: Point<f64, Logical>, id: i32) {
+    let Some(touch) = state.seat.get_touch() else {
+        return;
+    };
     touch.up(
         state,
         &smithay::input::touch::UpEvent {
-            slot,
+            slot: touch_slot(id),
             serial: SERIAL_COUNTER.next_serial(),
             time: smithay::backend::input::InputTime::now(),
         },
     );
     touch.frame(state);
+}
+
+fn nest_touch_cancel(state: &mut State<NestBackend>, _id: i32) {
+    let Some(touch) = state.seat.get_touch() else {
+        return;
+    };
+    touch.cancel(state);
+    touch.frame(state);
+}
+
+fn touch_slot(id: i32) -> smithay::backend::input::TouchSlot {
+    smithay::backend::input::TouchSlot::from(u32::try_from(id).ok())
+}
+
+pub(crate) struct NestKeyboard {
+    pressed: HashSet<u32>,
+}
+
+impl NestKeyboard {
+    pub fn new() -> Self {
+        Self {
+            pressed: HashSet::new(),
+        }
+    }
+
+    pub fn key(&mut self, state: &mut State<NestBackend>, evdev: u32, pressed: bool) {
+        if pressed {
+            if !self.pressed.insert(evdev) {
+                return;
+            }
+        } else if !self.pressed.remove(&evdev) {
+            return;
+        }
+        inject_key(state, evdev, pressed);
+    }
+
+    pub fn enter(&mut self, state: &mut State<NestBackend>, keys: &[u8]) {
+        for chunk in keys.as_chunks::<4>().0 {
+            let evdev = u32::from_ne_bytes(*chunk);
+            self.key(state, evdev, true);
+        }
+    }
+
+    pub fn leave(&mut self, state: &mut State<NestBackend>) {
+        let keys: Vec<u32> = self.pressed.drain().collect();
+        for evdev in keys {
+            inject_key(state, evdev, false);
+        }
+    }
+}
+
+fn inject_key(state: &mut State<NestBackend>, evdev: u32, pressed: bool) {
+    let Some(keyboard) = state.seat.get_keyboard() else {
+        return;
+    };
+    let key_state = if pressed {
+        KeyState::Pressed
+    } else {
+        KeyState::Released
+    };
+    keyboard.input(
+        state,
+        Keycode::new(evdev + 8),
+        key_state,
+        SERIAL_COUNTER.next_serial(),
+        InputTime::now(),
+        |_, _, _| FilterResult::<()>::Forward,
+    );
 }

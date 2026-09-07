@@ -1,6 +1,4 @@
 use std::collections::HashMap;
-#[cfg(feature = "session")]
-use std::collections::HashSet;
 use std::ffi::OsString;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -43,35 +41,6 @@ use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use crate::backend::Backend;
 use crate::layout::Layout;
 
-#[cfg(feature = "session")]
-use smithay::wayland::foreign_toplevel_list::ForeignToplevelListState;
-#[cfg(feature = "session")]
-use smithay::wayland::idle_inhibit::IdleInhibitManagerState;
-#[cfg(feature = "session")]
-use smithay::wayland::idle_notify::IdleNotifierState;
-#[cfg(feature = "session")]
-use smithay::wayland::input_method::InputMethodManagerState;
-#[cfg(feature = "session")]
-use smithay::wayland::selection::data_device::DataDeviceState;
-#[cfg(feature = "session")]
-use smithay::wayland::selection::wlr_data_control::DataControlState;
-#[cfg(feature = "session")]
-use smithay::wayland::session_lock::{SessionLockManagerState, SessionLocker};
-#[cfg(feature = "session")]
-use smithay::wayland::shell::xdg::dialog::XdgDialogState;
-#[cfg(feature = "session")]
-use smithay::wayland::text_input::TextInputManagerState;
-#[cfg(feature = "session")]
-use smithay::wayland::virtual_keyboard::VirtualKeyboardManagerState;
-#[cfg(feature = "session")]
-use smithay::wayland::xdg_activation::XdgActivationState;
-#[cfg(feature = "session")]
-use smithay::wayland::xdg_toplevel_icon::XdgToplevelIconManager;
-#[cfg(feature = "session")]
-use crate::handlers::foreign_toplevel::ForeignToplevelManagerState;
-#[cfg(feature = "session")]
-use crate::handlers::output_power::OutputPowerManagerState;
-
 /// How a toplevel is arranged right now.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum WindowMode {
@@ -87,7 +56,7 @@ pub enum WindowMode {
 pub struct WindowState {
     pub window: Window,
     pub mode: WindowMode,
-    /// True once first-commit handling ran and the window joined the `Space`.
+    /// True once the window joined the `Space`.
     pub mapped: bool,
     /// The xdg-dialog modal hint, cached so input handling needn't lock
     /// surface data on every click.
@@ -105,6 +74,9 @@ pub struct DndIcon {
 pub struct State<BackendData: Backend + 'static> {
     pub start_time: Instant,
     pub socket_name: OsString,
+    pub socket: SocketName,
+    #[cfg(feature = "session")]
+    pub session: crate::session::Session<BackendData>,
     pub display_handle: DisplayHandle,
 
     pub space: Space<Window>,
@@ -155,52 +127,18 @@ pub struct State<BackendData: Backend + 'static> {
     /// The toplevel surface last focused; the fallback keyboard focus when no
     /// layer-shell surface holds it.
     pub active_window: Option<WlSurface>,
-
-    #[cfg(feature = "session")]
-    pub xdg_activation_state: XdgActivationState,
-    #[cfg(feature = "session")]
-    pub data_device_state: DataDeviceState,
-    #[cfg(feature = "session")]
-    pub session_lock_state: SessionLockManagerState,
-    #[cfg(feature = "session")]
-    pub foreign_toplevel: ForeignToplevelManagerState,
-    #[cfg(feature = "session")]
-    pub foreign_toplevel_list: ForeignToplevelListState,
-    #[cfg(feature = "session")]
-    pub xdg_toplevel_icon: XdgToplevelIconManager,
-    #[cfg(feature = "session")]
-    pub xdg_dialog_state: XdgDialogState,
-    #[cfg(feature = "session")]
-    pub idle_notifier_state: IdleNotifierState<State<BackendData>>,
-    #[cfg(feature = "session")]
-    pub idle_inhibit_manager_state: IdleInhibitManagerState,
-    #[cfg(feature = "session")]
-    pub data_control_state: DataControlState,
-    #[cfg(feature = "session")]
-    pub output_power: OutputPowerManagerState,
-    #[cfg(feature = "session")]
-    pub idle_inhibiting_surfaces: HashSet<WlSurface>,
-    #[cfg(feature = "session")]
-    pub pending_lock: Option<SessionLocker>,
 }
 
 /// Which listening socket `State` binds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SocketName {
     /// Session compositor: `wayland-1` … `wayland-32`.
     Session,
-    /// Nest: `wayland-widget-0` … `wayland-widget-7`.
-    Widget,
+    /// Nest: `wayland-nest-0` … `wayland-nest-7`.
+    Nest,
 }
 
 impl<BackendData: Backend + 'static> State<BackendData> {
-    pub fn new(
-        event_loop: &mut EventLoop<'static, Self>,
-        display: Display<Self>,
-        backend_data: BackendData,
-    ) -> Self {
-        Self::new_with_socket(event_loop, display, backend_data, SocketName::Session)
-    }
-
     pub fn new_with_socket(
         event_loop: &mut EventLoop<'static, Self>,
         display: Display<Self>,
@@ -243,35 +181,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         let layouts: HashMap<Output, Layout> = HashMap::new();
         CursorShapeManagerState::new::<Self>(&dh);
         #[cfg(feature = "session")]
-        let mut xdg_toplevel_icon = XdgToplevelIconManager::new::<Self>(&dh);
-        #[cfg(feature = "session")]
-        xdg_toplevel_icon.add_icon_size(64);
-        #[cfg(feature = "session")]
-        TextInputManagerState::new::<Self>(&dh);
-        #[cfg(feature = "session")]
-        InputMethodManagerState::new::<Self, _>(&dh, |_client| true);
-        #[cfg(feature = "session")]
-        VirtualKeyboardManagerState::new::<Self, _>(&dh, |_client| true);
-        #[cfg(feature = "session")]
-        let xdg_activation_state = XdgActivationState::new::<Self>(&dh);
-        #[cfg(feature = "session")]
-        let data_device_state = DataDeviceState::new::<Self>(&dh);
-        #[cfg(feature = "session")]
-        let session_lock_state = SessionLockManagerState::new::<Self, _>(&dh, |_| true);
-        #[cfg(feature = "session")]
-        let foreign_toplevel = ForeignToplevelManagerState::new::<Self>(&dh);
-        #[cfg(feature = "session")]
-        let foreign_toplevel_list = ForeignToplevelListState::new::<Self>(&dh);
-        #[cfg(feature = "session")]
-        let xdg_dialog_state = XdgDialogState::new::<Self>(&dh);
-        #[cfg(feature = "session")]
-        let idle_notifier_state = IdleNotifierState::new(&dh, event_loop.handle());
-        #[cfg(feature = "session")]
-        let idle_inhibit_manager_state = IdleInhibitManagerState::new::<Self>(&dh);
-        #[cfg(feature = "session")]
-        let data_control_state = DataControlState::new::<Self, _>(&dh, None, |_| true);
-        #[cfg(feature = "session")]
-        let output_power = OutputPowerManagerState::new::<Self>(&dh);
+        let session = crate::session::Session::new(&dh, event_loop);
 
         let socket_name = Self::init_wayland_listener(display, event_loop, socket);
         let loop_signal = event_loop.get_signal();
@@ -279,6 +189,9 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         Self {
             start_time,
             socket_name,
+            socket,
+            #[cfg(feature = "session")]
+            session,
             display_handle: dh,
             space,
             toplevels: HashMap::new(),
@@ -308,47 +221,25 @@ impl<BackendData: Backend + 'static> State<BackendData> {
             layouts,
             layer_shell_on_demand_focus: None,
             active_window: None,
-            #[cfg(feature = "session")]
-            xdg_activation_state,
-            #[cfg(feature = "session")]
-            data_device_state,
-            #[cfg(feature = "session")]
-            session_lock_state,
-            #[cfg(feature = "session")]
-            foreign_toplevel,
-            #[cfg(feature = "session")]
-            foreign_toplevel_list,
-            #[cfg(feature = "session")]
-            xdg_toplevel_icon,
-            #[cfg(feature = "session")]
-            xdg_dialog_state,
-            #[cfg(feature = "session")]
-            idle_notifier_state,
-            #[cfg(feature = "session")]
-            idle_inhibit_manager_state,
-            #[cfg(feature = "session")]
-            data_control_state,
-            #[cfg(feature = "session")]
-            output_power,
-            #[cfg(feature = "session")]
-            idle_inhibiting_surfaces: HashSet::new(),
-            #[cfg(feature = "session")]
-            pending_lock: None,
         }
+    }
+
+    pub fn is_session(&self) -> bool {
+        matches!(self.socket, SocketName::Session)
     }
 
     fn bind_socket(socket: SocketName) -> ListeningSocketSource {
         match socket {
             SocketName::Session => ListeningSocketSource::new_auto().unwrap(),
-            SocketName::Widget => {
+            SocketName::Nest => {
                 for i in 0..8 {
-                    match ListeningSocketSource::with_name(&format!("wayland-widget-{i}")) {
+                    match ListeningSocketSource::with_name(&format!("wayland-nest-{i}")) {
                         Ok(source) => return source,
                         Err(BindError::AlreadyInUse) => {}
                         Err(err) => panic!("failed to bind nest socket: {err}"),
                     }
                 }
-                panic!("wayland-widget-0..7 all in use");
+                panic!("wayland-nest-0..7 all in use");
             }
         }
     }
@@ -389,14 +280,14 @@ impl<BackendData: Backend + 'static> State<BackendData> {
     }
 
     /// Per-frame bookkeeping shared by udev, winit, and the homescreen nest.
-    pub fn on_idle(&mut self) {
+    /// Returns toplevels dropped because the client died without `toplevel_destroyed`.
+    pub fn on_idle(&mut self) -> Vec<WlSurface> {
         self.space.refresh();
         self.popups.cleanup();
-        self.cleanup_toplevels();
+        let dropped = self.cleanup_toplevels();
         self.update_keyboard_focus();
-        #[cfg(feature = "session")]
-        self.foreign_toplevel_refresh();
         let _ = self.display_handle.flush_clients();
+        dropped
     }
 
     /// Queue a redraw on every output; the backend skips ones already pending.
@@ -428,11 +319,6 @@ impl<BackendData: Backend + 'static> State<BackendData> {
                 );
             }
 
-            // Send `locked` once a live lock surface has been registered.
-            let has_live_surface = self.lock_surfaces.iter().any(|s| s.alive());
-            if has_live_surface && let Some(locker) = self.pending_lock.take() {
-                locker.lock();
-            }
             return;
         }
         {
@@ -521,14 +407,6 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         });
     }
 
-    /// Recompute idle-notify inhibition from the active `zwp_idle_inhibitor_v1`
-    /// surfaces.
-    #[cfg(feature = "session")]
-    pub fn update_idle_inhibit(&mut self) {
-        let inhibited = !self.idle_inhibiting_surfaces.is_empty();
-        self.idle_notifier_state.set_is_inhibited(inhibited);
-    }
-
     /// The topmost window currently in `Fullscreen` mode, if any. While one is
     /// active it is rendered above the top layer and keeps keyboard focus.
     pub fn active_fullscreen_window(&self) -> Option<Window> {
@@ -547,20 +425,20 @@ impl<BackendData: Backend + 'static> State<BackendData> {
 
     /// Prune bookkeeping for toplevels whose client went away without the
     /// `toplevel_destroyed` path (e.g. a crash); dropping the entry also drops
-    /// its foreign-toplevel handle.
-    pub fn cleanup_toplevels(&mut self) {
-        self.toplevels
-            .retain(|_, ws| ws.window.toplevel().unwrap().wl_surface().is_alive());
+    /// its foreign-toplevel handle. Returns the surfaces that were removed.
+    pub fn cleanup_toplevels(&mut self) -> Vec<WlSurface> {
+        let mut dropped = Vec::new();
+        self.toplevels.retain(|surface, ws| {
+            let alive = ws.window.toplevel().unwrap().wl_surface().is_alive();
+            if !alive {
+                dropped.push(surface.clone());
+            }
+            alive
+        });
         for layout in self.layouts.values_mut() {
             layout.retain(|s| s.is_alive());
         }
-        #[cfg(feature = "session")]
-        {
-            // Prune dead idle-inhibitor surfaces and re-evaluate.
-            self.idle_inhibiting_surfaces
-                .retain(|surface| surface.is_alive());
-            self.update_idle_inhibit();
-        }
+        dropped
     }
 
     /// The topmost window currently marked modal, if any. While open, input to
@@ -641,6 +519,33 @@ impl<BackendData: Backend + 'static> State<BackendData> {
                         == KeyboardInteractivity::OnDemand
             })
         })
+    }
+}
+
+#[cfg(feature = "session")]
+impl<B: Backend + 'static> State<B> {
+    pub fn new(
+        event_loop: &mut EventLoop<'static, Self>,
+        display: Display<Self>,
+        backend_data: B,
+    ) -> Self {
+        Self::new_with_socket(event_loop, display, backend_data, SocketName::Session)
+    }
+
+    pub fn update_idle_inhibit(&mut self) {
+        self.session
+            .idle_inhibiting_surfaces
+            .retain(|surface| surface.is_alive());
+        let inhibited = !self.session.idle_inhibiting_surfaces.is_empty();
+        self.session.idle_notifier_state.set_is_inhibited(inhibited);
+    }
+
+    pub fn confirm_pending_lock(&mut self) {
+        if self.lock_surfaces.iter().any(|s| s.alive())
+            && let Some(locker) = self.session.pending_lock.take()
+        {
+            locker.lock();
+        }
     }
 }
 

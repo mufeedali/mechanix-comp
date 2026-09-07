@@ -84,7 +84,7 @@ struct DeviceData {
 }
 
 pub struct UdevData {
-    session: LibSeatSession,
+    login: LibSeatSession,
     loop_handle: LoopHandle<'static, State<UdevData>>,
     primary_gpu: DrmNode,
     /// Single GLES renderer bound to the primary GPU. Created when the primary
@@ -114,7 +114,7 @@ impl Backend for UdevData {
     }
 
     fn seat_name(&self) -> String {
-        self.session.seat()
+        self.login.seat()
     }
 
     fn reset_buffers(&mut self, output: &Output) {
@@ -128,7 +128,7 @@ impl Backend for UdevData {
 
     fn change_vt(&mut self, vt: i32) {
         info!(to = vt, "Trying to switch vt");
-        if let Err(err) = self.session.change_vt(vt) {
+        if let Err(err) = self.login.change_vt(vt) {
             error!(vt, "Error switching vt: {}", err);
         }
     }
@@ -218,7 +218,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let loop_handle = event_loop.handle();
     let udev_data = UdevData {
-        session,
+        login: session,
         loop_handle: loop_handle.clone(),
         primary_gpu,
         renderer: None,
@@ -237,7 +237,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let udev_backend = UdevBackend::new(state.seat.name())?;
     // Initialize libinput backend
     let mut libinput_context = Libinput::new_with_udev::<LibinputSessionInterface<LibSeatSession>>(
-        state.backend_data.session.clone().into(),
+        state.backend_data.login.clone().into(),
     );
     libinput_context
         .udev_assign_seat(state.seat.name())
@@ -359,6 +359,8 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     event_loop.run(None, &mut state, move |state| {
         state.on_idle();
+        state.foreign_toplevel_refresh();
+        state.update_idle_inhibit();
     })?;
 
     Ok(())
@@ -376,7 +378,7 @@ impl State<UdevData> {
             return Ok(());
         }
 
-        let fd = self.backend_data.session.open(
+        let fd = self.backend_data.login.open(
             path,
             OFlags::RDWR | OFlags::CLOEXEC | OFlags::NOCTTY | OFlags::NONBLOCK,
         )?;
@@ -624,7 +626,7 @@ impl State<UdevData> {
             .cloned();
         if let Some(output) = output {
             #[cfg(feature = "session")]
-            self.output_power.output_removed(&output);
+            self.session.output_power.output_removed(&output);
             self.space.unmap_output(&output);
         }
     }
@@ -651,7 +653,7 @@ impl State<UdevData> {
         };
 
         #[cfg(feature = "session")]
-        if self.output_power.is_off(&output) {
+        if self.session.output_power.is_off(&output) {
             return;
         }
 
@@ -828,6 +830,7 @@ impl State<UdevData> {
         if !queued {
             // No pageflip; still deliver frame callbacks for the commit that woke us.
             self.send_frame_callbacks(&output);
+            self.confirm_pending_lock();
             // Keep repainting so surface removals get re-rendered.
             self.schedule_repaint(&output);
         }
@@ -855,6 +858,7 @@ impl State<UdevData> {
 
         if let Some(output) = self.output_for_crtc(node, crtc) {
             self.send_frame_callbacks(&output);
+            self.confirm_pending_lock();
             self.schedule_repaint(&output);
         }
     }

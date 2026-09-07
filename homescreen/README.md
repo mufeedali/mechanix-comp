@@ -18,7 +18,7 @@ Needs nightly Cargo.
 cargo run -p homescreen
 ```
 
-The nest binds `wayland-widget-0` (then `-1`…). Widgets are ordinary xdg
+The nest binds `wayland-nest-0` (then `-1`…). Widgets are ordinary xdg
 clients on that socket. Icons launch on the host `WAYLAND_DISPLAY`.
 
 Config: `$XDG_CONFIG_HOME/mechanix/homescreen.toml` (or `MECHANIX_HOME_CONFIG`).
