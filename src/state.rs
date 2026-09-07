@@ -72,50 +72,6 @@ use crate::handlers::foreign_toplevel::ForeignToplevelManagerState;
 #[cfg(feature = "session")]
 use crate::handlers::output_power::OutputPowerManagerState;
 
-/// Session-only protocol state. Compiled out of the homescreen nest.
-#[cfg(feature = "session")]
-pub struct Session<BackendData: Backend + 'static> {
-    pub xdg_activation_state: XdgActivationState,
-    pub data_device_state: DataDeviceState,
-    pub session_lock_state: SessionLockManagerState,
-    pub foreign_toplevel: ForeignToplevelManagerState,
-    pub foreign_toplevel_list: ForeignToplevelListState,
-    pub xdg_toplevel_icon: XdgToplevelIconManager,
-    pub xdg_dialog_state: XdgDialogState,
-    pub idle_notifier_state: IdleNotifierState<State<BackendData>>,
-    pub idle_inhibit_manager_state: IdleInhibitManagerState,
-    pub data_control_state: DataControlState,
-    pub output_power: OutputPowerManagerState,
-    pub idle_inhibiting_surfaces: HashSet<WlSurface>,
-    pub pending_lock: Option<SessionLocker>,
-}
-
-#[cfg(feature = "session")]
-impl<BackendData: Backend + 'static> Session<BackendData> {
-    fn new(dh: &DisplayHandle, event_loop: &EventLoop<'static, State<BackendData>>) -> Self {
-        let mut xdg_toplevel_icon = XdgToplevelIconManager::new::<State<BackendData>>(dh);
-        xdg_toplevel_icon.add_icon_size(64);
-        TextInputManagerState::new::<State<BackendData>>(dh);
-        InputMethodManagerState::new::<State<BackendData>, _>(dh, |_client| true);
-        VirtualKeyboardManagerState::new::<State<BackendData>, _>(dh, |_client| true);
-        Self {
-            xdg_activation_state: XdgActivationState::new::<State<BackendData>>(dh),
-            data_device_state: DataDeviceState::new::<State<BackendData>>(dh),
-            session_lock_state: SessionLockManagerState::new::<State<BackendData>, _>(dh, |_| true),
-            foreign_toplevel: ForeignToplevelManagerState::new::<State<BackendData>>(dh),
-            foreign_toplevel_list: ForeignToplevelListState::new::<State<BackendData>>(dh),
-            xdg_toplevel_icon,
-            xdg_dialog_state: XdgDialogState::new::<State<BackendData>>(dh),
-            idle_notifier_state: IdleNotifierState::new(dh, event_loop.handle()),
-            idle_inhibit_manager_state: IdleInhibitManagerState::new::<State<BackendData>>(dh),
-            data_control_state: DataControlState::new::<State<BackendData>, _>(dh, None, |_| true),
-            output_power: OutputPowerManagerState::new::<State<BackendData>>(dh),
-            idle_inhibiting_surfaces: HashSet::new(),
-            pending_lock: None,
-        }
-    }
-}
-
 /// How a toplevel is arranged right now.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum WindowMode {
@@ -199,8 +155,33 @@ pub struct State<BackendData: Backend + 'static> {
     /// The toplevel surface last focused; the fallback keyboard focus when no
     /// layer-shell surface holds it.
     pub active_window: Option<WlSurface>,
+
     #[cfg(feature = "session")]
-    pub session: Session<BackendData>,
+    pub xdg_activation_state: XdgActivationState,
+    #[cfg(feature = "session")]
+    pub data_device_state: DataDeviceState,
+    #[cfg(feature = "session")]
+    pub session_lock_state: SessionLockManagerState,
+    #[cfg(feature = "session")]
+    pub foreign_toplevel: ForeignToplevelManagerState,
+    #[cfg(feature = "session")]
+    pub foreign_toplevel_list: ForeignToplevelListState,
+    #[cfg(feature = "session")]
+    pub xdg_toplevel_icon: XdgToplevelIconManager,
+    #[cfg(feature = "session")]
+    pub xdg_dialog_state: XdgDialogState,
+    #[cfg(feature = "session")]
+    pub idle_notifier_state: IdleNotifierState<State<BackendData>>,
+    #[cfg(feature = "session")]
+    pub idle_inhibit_manager_state: IdleInhibitManagerState,
+    #[cfg(feature = "session")]
+    pub data_control_state: DataControlState,
+    #[cfg(feature = "session")]
+    pub output_power: OutputPowerManagerState,
+    #[cfg(feature = "session")]
+    pub idle_inhibiting_surfaces: HashSet<WlSurface>,
+    #[cfg(feature = "session")]
+    pub pending_lock: Option<SessionLocker>,
 }
 
 /// Which listening socket `State` binds.
@@ -262,7 +243,35 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         let layouts: HashMap<Output, Layout> = HashMap::new();
         CursorShapeManagerState::new::<Self>(&dh);
         #[cfg(feature = "session")]
-        let session = Session::new(&dh, event_loop);
+        let mut xdg_toplevel_icon = XdgToplevelIconManager::new::<Self>(&dh);
+        #[cfg(feature = "session")]
+        xdg_toplevel_icon.add_icon_size(64);
+        #[cfg(feature = "session")]
+        TextInputManagerState::new::<Self>(&dh);
+        #[cfg(feature = "session")]
+        InputMethodManagerState::new::<Self, _>(&dh, |_client| true);
+        #[cfg(feature = "session")]
+        VirtualKeyboardManagerState::new::<Self, _>(&dh, |_client| true);
+        #[cfg(feature = "session")]
+        let xdg_activation_state = XdgActivationState::new::<Self>(&dh);
+        #[cfg(feature = "session")]
+        let data_device_state = DataDeviceState::new::<Self>(&dh);
+        #[cfg(feature = "session")]
+        let session_lock_state = SessionLockManagerState::new::<Self, _>(&dh, |_| true);
+        #[cfg(feature = "session")]
+        let foreign_toplevel = ForeignToplevelManagerState::new::<Self>(&dh);
+        #[cfg(feature = "session")]
+        let foreign_toplevel_list = ForeignToplevelListState::new::<Self>(&dh);
+        #[cfg(feature = "session")]
+        let xdg_dialog_state = XdgDialogState::new::<Self>(&dh);
+        #[cfg(feature = "session")]
+        let idle_notifier_state = IdleNotifierState::new(&dh, event_loop.handle());
+        #[cfg(feature = "session")]
+        let idle_inhibit_manager_state = IdleInhibitManagerState::new::<Self>(&dh);
+        #[cfg(feature = "session")]
+        let data_control_state = DataControlState::new::<Self, _>(&dh, None, |_| true);
+        #[cfg(feature = "session")]
+        let output_power = OutputPowerManagerState::new::<Self>(&dh);
 
         let socket_name = Self::init_wayland_listener(display, event_loop, socket);
         let loop_signal = event_loop.get_signal();
@@ -300,7 +309,31 @@ impl<BackendData: Backend + 'static> State<BackendData> {
             layer_shell_on_demand_focus: None,
             active_window: None,
             #[cfg(feature = "session")]
-            session,
+            xdg_activation_state,
+            #[cfg(feature = "session")]
+            data_device_state,
+            #[cfg(feature = "session")]
+            session_lock_state,
+            #[cfg(feature = "session")]
+            foreign_toplevel,
+            #[cfg(feature = "session")]
+            foreign_toplevel_list,
+            #[cfg(feature = "session")]
+            xdg_toplevel_icon,
+            #[cfg(feature = "session")]
+            xdg_dialog_state,
+            #[cfg(feature = "session")]
+            idle_notifier_state,
+            #[cfg(feature = "session")]
+            idle_inhibit_manager_state,
+            #[cfg(feature = "session")]
+            data_control_state,
+            #[cfg(feature = "session")]
+            output_power,
+            #[cfg(feature = "session")]
+            idle_inhibiting_surfaces: HashSet::new(),
+            #[cfg(feature = "session")]
+            pending_lock: None,
         }
     }
 
@@ -397,7 +430,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
 
             // Send `locked` once a live lock surface has been registered.
             let has_live_surface = self.lock_surfaces.iter().any(|s| s.alive());
-            if has_live_surface && let Some(locker) = self.session.pending_lock.take() {
+            if has_live_surface && let Some(locker) = self.pending_lock.take() {
                 locker.lock();
             }
             return;
@@ -492,8 +525,8 @@ impl<BackendData: Backend + 'static> State<BackendData> {
     /// surfaces.
     #[cfg(feature = "session")]
     pub fn update_idle_inhibit(&mut self) {
-        let inhibited = !self.session.idle_inhibiting_surfaces.is_empty();
-        self.session.idle_notifier_state.set_is_inhibited(inhibited);
+        let inhibited = !self.idle_inhibiting_surfaces.is_empty();
+        self.idle_notifier_state.set_is_inhibited(inhibited);
     }
 
     /// The topmost window currently in `Fullscreen` mode, if any. While one is
@@ -524,8 +557,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         #[cfg(feature = "session")]
         {
             // Prune dead idle-inhibitor surfaces and re-evaluate.
-            self.session
-                .idle_inhibiting_surfaces
+            self.idle_inhibiting_surfaces
                 .retain(|surface| surface.is_alive());
             self.update_idle_inhibit();
         }

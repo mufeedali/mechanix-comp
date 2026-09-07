@@ -624,7 +624,7 @@ impl State<UdevData> {
             .cloned();
         if let Some(output) = output {
             #[cfg(feature = "session")]
-            self.session.output_power.output_removed(&output);
+            self.output_power.output_removed(&output);
             self.space.unmap_output(&output);
         }
     }
@@ -651,7 +651,7 @@ impl State<UdevData> {
         };
 
         #[cfg(feature = "session")]
-        if self.session.output_power.is_off(&output) {
+        if self.output_power.is_off(&output) {
             return;
         }
 
