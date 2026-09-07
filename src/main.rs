@@ -1,11 +1,5 @@
-mod backend;
-mod cursor;
-mod drawing;
-mod handlers;
-mod input;
-mod layout;
-mod render;
-mod state;
+#[cfg(any(feature = "backend-winit", feature = "backend-udev"))]
+use compositor::backend;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Backend selection: an explicit `MECHA_BACKEND` wins; otherwise we assume
@@ -22,9 +16,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     if use_winit {
-        backend::winit::run()
+        #[cfg(feature = "backend-winit")]
+        {
+            backend::winit::run()
+        }
+        #[cfg(not(feature = "backend-winit"))]
+        {
+            Err("winit backend not compiled (enable feature backend-winit)".into())
+        }
     } else {
-        backend::udev::run()
+        #[cfg(feature = "backend-udev")]
+        {
+            backend::udev::run()
+        }
+        #[cfg(not(feature = "backend-udev"))]
+        {
+            Err("udev backend not compiled (enable feature backend-udev)".into())
+        }
     }
 }
 
