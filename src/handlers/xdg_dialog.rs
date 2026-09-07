@@ -1,6 +1,5 @@
 use crate::backend::Backend;
 use crate::state::State;
-use smithay::desktop::Window;
 use smithay::wayland::shell::xdg::dialog::{ToplevelDialogHint, XdgDialogHandler};
 
 impl<BackendData: Backend + 'static> XdgDialogHandler for State<BackendData> {
@@ -16,20 +15,4 @@ impl<BackendData: Backend + 'static> XdgDialogHandler for State<BackendData> {
     }
 }
 
-impl<BackendData: Backend + 'static> State<BackendData> {
-    /// The topmost window currently marked modal, if any. While open, input to
-    /// every other window is blocked.
-    pub fn active_modal_window(&self) -> Option<Window> {
-        self.space
-            .elements()
-            .rev()
-            .find(|w| {
-                w.toplevel().is_some_and(|toplevel| {
-                    self.toplevels
-                        .get(toplevel.wl_surface())
-                        .is_some_and(|ws| ws.modal)
-                })
-            })
-            .cloned()
-    }
-}
+

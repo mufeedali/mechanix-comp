@@ -358,14 +358,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     event_loop.run(None, &mut state, move |state| {
-        // Per-frame upkeep: refresh the space, clean up dead popups/toplevels,
-        // re-derive keyboard focus, and flush client events.
-        state.space.refresh();
-        state.popups.cleanup();
-        state.cleanup_toplevels();
-        state.update_keyboard_focus();
-        state.foreign_toplevel_refresh();
-        let _ = state.display_handle.flush_clients();
+        state.on_idle();
     })?;
 
     Ok(())
@@ -630,7 +623,8 @@ impl State<UdevData> {
             })
             .cloned();
         if let Some(output) = output {
-            self.output_power.output_removed(&output);
+            #[cfg(feature = "session")]
+            self.session.output_power.output_removed(&output);
             self.space.unmap_output(&output);
         }
     }
@@ -656,7 +650,8 @@ impl State<UdevData> {
             return;
         };
 
-        if self.output_power.is_off(&output) {
+        #[cfg(feature = "session")]
+        if self.session.output_power.is_off(&output) {
             return;
         }
 

@@ -1,9 +1,11 @@
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::output::Output;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
-use smithay::utils::{Physical, Size, Transform};
+use smithay::utils::{Logical, Physical, Rectangle, Size, Transform};
 
+#[cfg(feature = "backend-udev")]
 pub mod udev;
+#[cfg(feature = "backend-winit")]
 pub mod winit;
 
 /// 2x only for clearly HiDPI panels: tall enough, real physical size, >192 DPI on both axes.
@@ -88,5 +90,23 @@ pub trait Backend {
     /// want identity; udev/DRM (and trait default) reports them in the output's transformed space.
     fn touch_transform(&self, output: &Output) -> Transform {
         output.current_transform()
+    }
+
+    /// Optional override: a newly created toplevel was added.
+    fn on_new_toplevel(&mut self, _surface: &WlSurface) {}
+
+    /// Optional override: a toplevel was destroyed or unmapped.
+    fn on_unmapped(&mut self, _surface: &WlSurface) {}
+
+    /// Optional override: place this surface at `rect` instead of the
+    /// session maximize-to-zone path. `None` keeps default layout.
+    fn placement(&self, _surface: &WlSurface) -> Option<Rectangle<i32, Logical>> {
+        None
+    }
+
+    /// Optional override: surfaces to draw this frame. `None` keeps the
+    /// session compositor's active-group filter.
+    fn visible_surfaces(&self) -> Option<Vec<WlSurface>> {
+        None
     }
 }
