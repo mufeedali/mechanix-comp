@@ -10,9 +10,14 @@ use tracing::{info, warn};
 
 use crate::chrome::{self, Fill, Handle};
 use crate::config::{self, HomeConfig, IconConfig, SlotConfig};
+use crate::grid::{
+    self, Dir, GridMetrics, RectCells, nearest_cell, push_dirs, push_resolve, resize_cells,
+    resize_preview,
+};
 use crate::pages::Pages;
+use crate::spawn::{self, parse_desktop, spawn_on_nest};
 
-const GAP: i32 = 16;
+const GAP: i32 = grid::GAP;
 const LONG_PRESS: Duration = Duration::from_millis(500);
 const SLOP: f64 = 20.0;
 /// Visual pop while lifted. Hole math uses the un-nudged rest position.
@@ -111,15 +116,6 @@ enum Gesture {
     },
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct RectCells {
-    page: u32,
-    col: u32,
-    row: u32,
-    col_span: u32,
-    row_span: u32,
-}
-
 pub enum HomeAction {
     None,
     Redraw,
@@ -134,7 +130,9 @@ pub enum HomeAction {
     Launch(String),
     CloseSurface(WlSurface),
     /// Config changed: close leftover nest surfaces, then relayout.
-    Reload { close: Vec<WlSurface> },
+    Reload {
+        close: Vec<WlSurface>,
+    },
 }
 
 pub struct Home {
@@ -339,7 +337,9 @@ impl Home {
             return;
         };
         if let Kind::Widget {
-            command, surface: slot, ..
+            command,
+            surface: slot,
+            ..
         } = &mut item.kind
         {
             info!(cmd = %command, "claimed nest toplevel for slot");
@@ -514,7 +514,9 @@ impl Home {
         }
         let item = self.hit_item(pos);
         // Already editing: pick up immediately, no second long-press.
-        if self.edit && let Some(id) = item {
+        if self.edit
+            && let Some(id) = item
+        {
             return self.start_lift(id, pos);
         }
         self.gesture = Gesture::Pending {
@@ -599,7 +601,10 @@ impl Home {
             } => {
                 let dt = Instant::now().saturating_duration_since(t0);
                 let dist = (pos.x - start.x).hypot(pos.y - start.y);
-                if dt >= LONG_PRESS && dist <= SLOP && let Some(id) = item {
+                if dt >= LONG_PRESS
+                    && dist <= SLOP
+                    && let Some(id) = item
+                {
                     self.enter_edit(id);
                     return HomeAction::Redraw;
                 }
@@ -685,10 +690,7 @@ impl Home {
 
     fn tick_long_press(&mut self) -> HomeAction {
         let Gesture::Pending {
-            start,
-            t0,
-            item,
-            ..
+            start, t0, item, ..
         } = self.gesture
         else {
             return HomeAction::None;
@@ -747,12 +749,7 @@ impl Home {
     }
 
     fn begin_drag(&mut self) {
-        self.drag_snapshot = Some(
-            self.items
-                .iter()
-                .map(|i| (i.id, i.cells))
-                .collect(),
-        );
+        self.drag_snapshot = Some(self.items.iter().map(|i| (i.id, i.cells)).collect());
     }
 
     fn restore_snapshot(&mut self) {
@@ -766,10 +763,7 @@ impl Home {
     }
 
     fn outside_grid(&self, pos: Point<f64, Logical>) -> bool {
-        pos.x < 0.0
-            || pos.y < 0.0
-            || pos.x >= self.output.w as f64
-            || pos.y >= self.output.h as f64
+        pos.x < 0.0 || pos.y < 0.0 || pos.x >= self.output.w as f64 || pos.y >= self.output.h as f64
     }
 
     fn snapshot_cells(&self, id: ItemId) -> RectCells {
@@ -804,7 +798,12 @@ impl Home {
         self.lift_loc = (rest.x, rest.y + LIFT_NUDGE_Y).into();
     }
 
-    fn lift_rest(&self, id: ItemId, start: Point<f64, Logical>, pos: Point<f64, Logical>) -> Point<i32, Logical> {
+    fn lift_rest(
+        &self,
+        id: ItemId,
+        start: Point<f64, Logical>,
+        pos: Point<f64, Logical>,
+    ) -> Point<i32, Logical> {
         let origin_rect = self.rect_of(self.snapshot_cells(id));
         Point::from((
             origin_rect.loc.x + (pos.x - start.x).round() as i32,
@@ -852,7 +851,9 @@ impl Home {
         };
         let now = Instant::now();
         match self.page_edge {
-            Some((prev, t0)) if prev == dir && now.saturating_duration_since(t0) >= PAGE_EDGE_HOLD => {
+            Some((prev, t0))
+                if prev == dir && now.saturating_duration_since(t0) >= PAGE_EDGE_HOLD =>
+            {
                 let next = self.page() as i32 + dir;
                 let max = self.page_count() as i32;
                 if next < 0 || next > max {
@@ -950,14 +951,16 @@ impl Home {
         let snapshot: &[(ItemId, RectCells)] = match &self.drag_snapshot {
             Some(s) => s,
             None => {
-                owned = self.items.iter().map(|i| (i.id, i.cells)).collect::<Vec<_>>();
+                owned = self
+                    .items
+                    .iter()
+                    .map(|i| (i.id, i.cells))
+                    .collect::<Vec<_>>();
                 &owned
             }
         };
         for dir in dirs {
-            if let Some(placed) =
-                push_resolve(snapshot, id, next, dir, self.columns, self.rows)
-            {
+            if let Some(placed) = push_resolve(snapshot, id, next, dir, self.columns, self.rows) {
                 for (item, cells) in placed {
                     self.apply_cells(item, cells);
                 }
@@ -1166,7 +1169,7 @@ impl Home {
         };
         let mut cmd = Command::new("sh");
         cmd.arg("-c").arg(exec);
-        apply_wayland_only(&mut cmd, &display);
+        spawn::apply_wayland_only(&mut cmd, &display);
         match cmd.spawn() {
             Ok(child) => info!(pid = child.id(), exec, "launched icon on host"),
             Err(err) => warn!(%err, exec, "icon launch failed"),
@@ -1201,7 +1204,9 @@ impl Home {
         if let Some(id) = self.lifted() {
             out.extend(chrome::hole_overlay(self.item_rect(id)));
             out.extend(chrome::lift_overlay(self.lift_rect(id)));
-        } else if self.edit && let Some(id) = self.selected {
+        } else if self.edit
+            && let Some(id) = self.selected
+        {
             out.extend(chrome::edit_overlay(
                 self.chrome_tile(id),
                 self.item(id).is_some_and(Item::is_widget),
@@ -1239,253 +1244,19 @@ impl Home {
         pos: Point<f64, Logical>,
     ) -> RectCells {
         let (cw, ch) = self.cell();
-        let mut next = origin;
-        let pitch_x = (cw + GAP) as f64;
-        let pitch_y = (ch + GAP) as f64;
-        if handle.east() {
-            next.col_span = snap_span(
-                pos.x - origin_rect.loc.x as f64,
-                cw as f64,
-                pitch_x,
-                self.columns.saturating_sub(origin.col),
-            );
-        }
-        if handle.south() {
-            next.row_span = snap_span(
-                pos.y - origin_rect.loc.y as f64,
-                ch as f64,
-                pitch_y,
-                self.rows.saturating_sub(origin.row),
-            );
-        }
-        if handle.west() {
-            let right = origin.col + origin.col_span;
-            let span = snap_span(
-                (origin_rect.loc.x + origin_rect.size.w) as f64 - pos.x,
-                cw as f64,
-                pitch_x,
-                right.min(self.columns),
-            );
-            next.col = right.saturating_sub(span);
-            next.col_span = span;
-        }
-        if handle.north() {
-            let bottom = origin.row + origin.row_span;
-            let span = snap_span(
-                (origin_rect.loc.y + origin_rect.size.h) as f64 - pos.y,
-                ch as f64,
-                pitch_y,
-                bottom.min(self.rows),
-            );
-            next.row = bottom.saturating_sub(span);
-            next.row_span = span;
-        }
-        next.col_span = next.col_span.min(self.columns.saturating_sub(next.col)).max(1);
-        next.row_span = next.row_span.min(self.rows.saturating_sub(next.row)).max(1);
-        next
+        resize_cells(
+            origin,
+            origin_rect,
+            handle,
+            pos,
+            GridMetrics {
+                columns: self.columns,
+                rows: self.rows,
+                cw,
+                ch,
+            },
+        )
     }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Dir {
-    Left,
-    Right,
-    Up,
-    Down,
-}
-
-impl Dir {
-    fn step(self, cells: &mut RectCells, columns: u32, rows: u32) -> bool {
-        match self {
-            Dir::Left => {
-                if cells.col == 0 {
-                    return false;
-                }
-                cells.col -= 1;
-                true
-            }
-            Dir::Right => {
-                if cells.col + cells.col_span >= columns {
-                    return false;
-                }
-                cells.col += 1;
-                true
-            }
-            Dir::Up => {
-                if cells.row == 0 {
-                    return false;
-                }
-                cells.row -= 1;
-                true
-            }
-            Dir::Down => {
-                if cells.row + cells.row_span >= rows {
-                    return false;
-                }
-                cells.row += 1;
-                true
-            }
-        }
-    }
-
-    fn coord(self, cells: RectCells) -> i32 {
-        match self {
-            Dir::Left => -(cells.col as i32),
-            Dir::Right => (cells.col + cells.col_span) as i32,
-            Dir::Up => -(cells.row as i32),
-            Dir::Down => (cells.row + cells.row_span) as i32,
-        }
-    }
-}
-
-fn push_dirs(from: RectCells, to: RectCells, handle: Option<Handle>) -> [Dir; 4] {
-    let mut ordered = Vec::new();
-    if let Some(handle) = handle {
-        if handle.south() {
-            ordered.push(Dir::Down);
-        }
-        if handle.east() {
-            ordered.push(Dir::Right);
-        }
-        if handle.north() {
-            ordered.push(Dir::Up);
-        }
-        if handle.west() {
-            ordered.push(Dir::Left);
-        }
-    }
-    let dc = to.col as i32 - from.col as i32;
-    let dr = to.row as i32 - from.row as i32;
-    if dr.abs() >= dc.abs() {
-        ordered.push(if dr >= 0 { Dir::Down } else { Dir::Up });
-        ordered.push(if dc >= 0 { Dir::Right } else { Dir::Left });
-    } else {
-        ordered.push(if dc >= 0 { Dir::Right } else { Dir::Left });
-        ordered.push(if dr >= 0 { Dir::Down } else { Dir::Up });
-    }
-    for dir in [Dir::Down, Dir::Right, Dir::Left, Dir::Up] {
-        if !ordered.contains(&dir) {
-            ordered.push(dir);
-        }
-    }
-    [ordered[0], ordered[1], ordered[2], ordered[3]]
-}
-
-fn snapshot_of(snapshot: &[(ItemId, RectCells)], id: ItemId) -> Option<RectCells> {
-    snapshot.iter().find(|(i, _)| *i == id).map(|(_, c)| *c)
-}
-
-/// Push overlapping items in `dir` until the hole is free and no two items
-/// overlap. An item in the way of a pushed neighbor is pushed too, so a
-/// widget and the icon below it move as a group instead of one teleporting.
-fn push_resolve(
-    snapshot: &[(ItemId, RectCells)],
-    mover: ItemId,
-    hole: RectCells,
-    dir: Dir,
-    columns: u32,
-    rows: u32,
-) -> Option<Vec<(ItemId, RectCells)>> {
-    let mut pos: Vec<(ItemId, RectCells)> = snapshot
-        .iter()
-        .map(|(id, cells)| {
-            if *id == mover {
-                (*id, hole)
-            } else {
-                (*id, *cells)
-            }
-        })
-        .collect();
-    let limit = (columns * rows) as usize * pos.len().max(1);
-    for _ in 0..limit {
-        let Some(i) = first_conflict(&pos, mover, dir, snapshot, hole.page) else {
-            return Some(pos);
-        };
-        if !dir.step(&mut pos[i].1, columns, rows) {
-            return None;
-        }
-    }
-    None
-}
-
-fn first_conflict(
-    pos: &[(ItemId, RectCells)],
-    mover: ItemId,
-    dir: Dir,
-    snapshot: &[(ItemId, RectCells)],
-    page: u32,
-) -> Option<usize> {
-    let mover_cells = pos.iter().find(|(id, _)| *id == mover)?.1;
-    for (i, (id, cells)) in pos.iter().enumerate() {
-        if *id == mover || cells.page != page {
-            continue;
-        }
-        if overlaps(*cells, mover_cells) {
-            return Some(i);
-        }
-    }
-    for i in 0..pos.len() {
-        if pos[i].0 == mover || pos[i].1.page != page {
-            continue;
-        }
-        for j in (i + 1)..pos.len() {
-            if pos[j].0 == mover || pos[j].1.page != page {
-                continue;
-            }
-            if !overlaps(pos[i].1, pos[j].1) {
-                continue;
-            }
-            let a = snapshot_of(snapshot, pos[i].0).unwrap_or(pos[i].1);
-            let b = snapshot_of(snapshot, pos[j].0).unwrap_or(pos[j].1);
-            return Some(if dir.coord(a) >= dir.coord(b) { i } else { j });
-        }
-    }
-    None
-}
-
-fn resize_preview(
-    origin: Rectangle<i32, Logical>,
-    handle: Handle,
-    pos: Point<f64, Logical>,
-    min_w: i32,
-    min_h: i32,
-) -> Rectangle<i32, Logical> {
-    let mut preview = origin;
-    if handle.east() {
-        preview.size.w = (pos.x as i32 - preview.loc.x).max(min_w);
-    }
-    if handle.south() {
-        preview.size.h = (pos.y as i32 - preview.loc.y).max(min_h);
-    }
-    if handle.west() {
-        let right = origin.loc.x + origin.size.w;
-        preview.size.w = (right - pos.x as i32).max(min_w);
-        preview.loc.x = right - preview.size.w;
-    }
-    if handle.north() {
-        let bottom = origin.loc.y + origin.size.h;
-        preview.size.h = (bottom - pos.y as i32).max(min_h);
-        preview.loc.y = bottom - preview.size.h;
-    }
-    preview
-}
-
-/// Snap a top-left to the nearest cell. Threshold is halfway to the next cell.
-fn nearest_cell(pos: f64, origin: f64, pitch: f64, max: u32) -> u32 {
-    if pitch <= 0.0 {
-        return 0;
-    }
-    let idx = ((pos - origin) / pitch).round() as i32;
-    idx.clamp(0, max as i32) as u32
-}
-
-/// How many cells a dragged edge covers. Grows/shrinks past the midpoint of a cell.
-fn snap_span(length: f64, cell: f64, pitch: f64, max: u32) -> u32 {
-    if pitch <= 0.0 || max == 0 {
-        return 1;
-    }
-    let span = ((length - cell / 2.0) / pitch).floor() as i32 + 1;
-    span.clamp(1, max as i32) as u32
 }
 
 fn cells_of_slot(slot: &SlotConfig) -> RectCells {
@@ -1530,63 +1301,10 @@ fn take_icon(old: &[Item], icon: &IconConfig) -> Option<usize> {
                 && item.cells == cells
         })
         .or_else(|| {
-            old.iter().position(|item| {
-                matches!(&item.kind, Kind::Icon { desktop, .. } if desktop == &icon.desktop)
-            })
+            old.iter().position(
+                |item| matches!(&item.kind, Kind::Icon { desktop, .. } if desktop == &icon.desktop),
+            )
         })
-}
-
-fn overlaps(a: RectCells, b: RectCells) -> bool {
-    a.page == b.page
-        && a.col < b.col + b.col_span
-        && b.col < a.col + a.col_span
-        && a.row < b.row + b.row_span
-        && b.row < a.row + a.row_span
-}
-
-fn spawn_on_nest(command: &str, nest: &OsStr) -> std::io::Result<Child> {
-    let mut cmd = Command::new("sh");
-    cmd.arg("-c").arg(command);
-    apply_wayland_only(&mut cmd, nest);
-    cmd.spawn()
-}
-
-/// Force Wayland and drop X11 so a host-launched GTK app cannot fall through
-/// to GNOME's Xwayland when mechanix-comp is itself nested.
-fn apply_wayland_only(cmd: &mut Command, display: &OsStr) {
-    cmd.env("WAYLAND_DISPLAY", display)
-        .env("GDK_BACKEND", "wayland")
-        .env_remove("DISPLAY")
-        .env_remove("WAYLAND_SOCKET");
-}
-
-fn parse_desktop(path: &str) -> String {
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return String::new();
-    };
-    let mut exec = String::new();
-    let mut in_entry = false;
-    for line in text.lines() {
-        let line = line.trim();
-        if line.starts_with('[') {
-            in_entry = line.eq_ignore_ascii_case("[Desktop Entry]");
-            continue;
-        }
-        if !in_entry {
-            continue;
-        }
-        if let Some(rest) = line.strip_prefix("Exec=") {
-            exec = strip_field_codes(rest);
-        }
-    }
-    exec
-}
-
-fn strip_field_codes(exec: &str) -> String {
-    exec.split_whitespace()
-        .filter(|t| !t.starts_with('%'))
-        .collect::<Vec<_>>()
-        .join(" ")
 }
 
 #[cfg(test)]

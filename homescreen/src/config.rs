@@ -101,9 +101,7 @@ pub fn config_path() -> PathBuf {
     }
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config"))
-        })
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
         .unwrap_or_else(|| PathBuf::from("."));
     base.join("mechanix/homescreen.toml")
 }
@@ -155,7 +153,10 @@ impl ConfigWatch {
         let name = path
             .file_name()
             .ok_or_else(|| {
-                std::io::Error::new(std::io::ErrorKind::InvalidInput, "config path has no file name")
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "config path has no file name",
+                )
             })?
             .to_os_string();
         let raw = unsafe { libc::inotify_init1(libc::IN_CLOEXEC | libc::IN_NONBLOCK) };
@@ -171,7 +172,7 @@ impl ConfigWatch {
             | libc::IN_MODIFY
             | libc::IN_CLOSE_WRITE
             | libc::IN_ATTRIB;
-        let wd = unsafe { libc::inotify_add_watch(fd.as_raw_fd(), c_dir.as_ptr(), mask as u32) };
+        let wd = unsafe { libc::inotify_add_watch(fd.as_raw_fd(), c_dir.as_ptr(), mask) };
         if wd < 0 {
             return Err(std::io::Error::last_os_error());
         }

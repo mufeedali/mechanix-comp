@@ -87,10 +87,7 @@ pub(crate) fn fill(r: Rectangle<i32, Logical>, color: [f32; 4]) -> Fill {
 fn contains(r: Rectangle<i32, Logical>, pos: Point<f64, Logical>) -> bool {
     let x0 = r.loc.x as f64;
     let y0 = r.loc.y as f64;
-    pos.x >= x0
-        && pos.x < x0 + r.size.w as f64
-        && pos.y >= y0
-        && pos.y < y0 + r.size.h as f64
+    pos.x >= x0 && pos.x < x0 + r.size.w as f64 && pos.y >= y0 && pos.y < y0 + r.size.h as f64
 }
 
 /// Point on the frame that this handle owns. Resize keeps `pointer - anchor`
@@ -123,12 +120,7 @@ fn handle_size(handle: Handle) -> (i32, i32) {
 pub fn handle_rect(tile: Rectangle<i32, Logical>, handle: Handle) -> Rectangle<i32, Logical> {
     let a = handle_anchor(tile, handle);
     let (w, h) = handle_size(handle);
-    rect(
-        a.x.round() as i32 - w / 2,
-        a.y.round() as i32 - h / 2,
-        w,
-        h,
-    )
+    rect(a.x.round() as i32 - w / 2, a.y.round() as i32 - h / 2, w, h)
 }
 
 pub fn close_rect(tile: Rectangle<i32, Logical>) -> Rectangle<i32, Logical> {
@@ -158,10 +150,7 @@ fn knob(r: Rectangle<i32, Logical>, color: [f32; 4]) -> [Fill; 2] {
 
 pub fn grid_dot(center: Point<i32, Logical>) -> Fill {
     let half = DOT / 2;
-    fill(
-        rect(center.x - half, center.y - half, DOT, DOT),
-        DOT_FILL,
-    )
+    fill(rect(center.x - half, center.y - half, DOT, DOT), DOT_FILL)
 }
 
 pub fn hole_overlay(tile: Rectangle<i32, Logical>) -> Vec<Fill> {
