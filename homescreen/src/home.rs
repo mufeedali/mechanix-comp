@@ -10,6 +10,7 @@ use tracing::{info, warn};
 
 use crate::chrome::{self, Fill, Handle};
 use crate::config::{self, HomeConfig, IconConfig, SlotConfig};
+use crate::pages::Pages;
 
 const GAP: i32 = 16;
 const LONG_PRESS: Duration = Duration::from_millis(500);
@@ -140,7 +141,7 @@ pub struct Home {
     path: PathBuf,
     columns: u32,
     rows: u32,
-    page: u32,
+    pages: Pages,
     items: Vec<Item>,
     output: Size<i32, Logical>,
     edit: bool,
@@ -202,11 +203,11 @@ impl Home {
             });
             next_id += 1;
         }
-        Ok(Self {
+        let mut home = Self {
             path,
             columns: cfg.columns.max(1),
             rows: cfg.rows.max(1),
-            page: 0,
+            pages: Pages::default(),
             items,
             output: Size::from((0, 0)),
             edit: false,
@@ -220,11 +221,56 @@ impl Home {
             frame_preview: None,
             page_edge: None,
             wait: None,
-        })
+        };
+        home.compact_pages();
+        Ok(home)
     }
 
     pub fn set_output_size(&mut self, w: i32, h: i32) {
         self.output = Size::from((w, h));
+    }
+
+    fn page(&self) -> u32 {
+        self.pages.current()
+    }
+
+    fn set_page(&mut self, page: u32) {
+        self.pages.jump(page);
+    }
+
+    fn occupied_pages(&self) -> Vec<u32> {
+        self.items.iter().map(|i| i.cells.page).collect()
+    }
+
+    fn carrying_page(&self) -> Option<u32> {
+        match self.gesture {
+            Gesture::Lifted { item, .. } => Some(self.cells_of(item).page),
+            _ => None,
+        }
+    }
+
+    fn compact_pages(&mut self) {
+        if self.carrying_page().is_some() {
+            return;
+        }
+        let map = Pages::compact(self.occupied_pages());
+        for item in &mut self.items {
+            if let Some(&page) = map.get(&item.cells.page) {
+                item.cells.page = page;
+            }
+        }
+        if let Some(snap) = &mut self.drag_snapshot {
+            for (_, cells) in snap {
+                if let Some(&page) = map.get(&cells.page) {
+                    cells.page = page;
+                }
+            }
+        }
+        let next = map
+            .get(&self.page())
+            .copied()
+            .unwrap_or_else(|| self.page_count().saturating_sub(1));
+        self.set_page(next);
     }
 
     pub fn pump_spawns(&mut self, nest: &OsStr) {
@@ -333,16 +379,12 @@ impl Home {
     }
 
     fn page_count(&self) -> u32 {
-        self.items
-            .iter()
-            .map(|i| i.cells.page)
-            .max()
-            .unwrap_or(0)
-            + 1
+        self.pages
+            .count(&self.occupied_pages(), self.carrying_page())
     }
 
     fn shift_x(&self) -> i32 {
-        -(self.page as i32) * self.output.w + self.page_drag.round() as i32
+        self.pages.offset(0, self.output.w) + self.page_drag.round() as i32
     }
 
     fn cell(&self) -> (i32, i32) {
@@ -494,7 +536,7 @@ impl Home {
                 let dx = pos.x - start.x;
                 let dy = pos.y - start.y;
                 if dx.abs() > SLOP && dx.abs() > dy.abs() && !self.edit {
-                    let origin_page = self.page;
+                    let origin_page = self.page();
                     let carry = self.page_drag;
                     self.gesture = Gesture::Swipe {
                         start_x: start.x,
@@ -597,9 +639,9 @@ impl Home {
                     page -= 1;
                 }
                 let last = self.page_count().saturating_sub(1) as i32;
-                self.page = page.clamp(0, last) as u32;
+                self.set_page(page.clamp(0, last) as u32);
                 let visual = -(origin_page as f64) * width + dx;
-                self.page_drag = visual + self.page as f64 * width;
+                self.page_drag = visual + self.page() as f64 * width;
                 self.settle = Some(Animated::new(
                     self.page_drag as f32,
                     0.0,
@@ -615,6 +657,8 @@ impl Home {
                 self.frame_preview = None;
                 self.drag_snapshot = None;
                 self.page_edge = None;
+                self.pages.end_lift();
+                self.compact_pages();
                 self.persist();
                 HomeAction::Relayout
             }
@@ -694,6 +738,7 @@ impl Home {
 
     fn start_lift(&mut self, id: ItemId, start: Point<f64, Logical>) -> HomeAction {
         self.enter_edit(id);
+        self.pages.begin_lift(self.page_count());
         self.begin_drag();
         self.page_edge = None;
         self.gesture = Gesture::Lifted { item: id, start };
@@ -791,9 +836,9 @@ impl Home {
         if width <= 0.0 {
             return None;
         }
-        if pos.x <= PAGE_EDGE && self.page > 0 {
+        if pos.x <= PAGE_EDGE && self.page() > 0 {
             Some(-1)
-        } else if pos.x >= width - PAGE_EDGE && self.page < self.page_count() {
+        } else if pos.x >= width - PAGE_EDGE && self.page() < self.page_count() {
             Some(1)
         } else {
             None
@@ -808,7 +853,7 @@ impl Home {
         let now = Instant::now();
         match self.page_edge {
             Some((prev, t0)) if prev == dir && now.saturating_duration_since(t0) >= PAGE_EDGE_HOLD => {
-                let next = self.page as i32 + dir;
+                let next = self.page() as i32 + dir;
                 let max = self.page_count() as i32;
                 if next < 0 || next > max {
                     return None;
@@ -829,7 +874,7 @@ impl Home {
     fn lift_to_page(&mut self, id: ItemId, pos: Point<f64, Logical>, page: u32) -> HomeAction {
         let visual = self.lift_loc;
         self.restore_snapshot();
-        self.page = page;
+        self.set_page(page);
         self.begin_drag();
         let origin = self.rect_of(self.snapshot_cells(id));
         let rest: Point<i32, Logical> = Point::from((visual.x, visual.y - LIFT_NUDGE_Y));
@@ -859,7 +904,7 @@ impl Home {
             self.rows.saturating_sub(origin.row_span),
         );
         RectCells {
-            page: self.page,
+            page: self.page(),
             col,
             row,
             col_span: origin.col_span,
@@ -951,6 +996,7 @@ impl Home {
             }
             Kind::Icon { .. } => HomeAction::Redraw,
         };
+        self.compact_pages();
         self.persist();
         action
     }
@@ -1085,7 +1131,10 @@ impl Home {
         self.columns = cfg.columns.max(1);
         self.rows = cfg.rows.max(1);
         self.items = items;
-        self.page = self.page.min(self.page_count().saturating_sub(1));
+        self.compact_pages();
+        if self.current_config() != cfg {
+            self.persist();
+        }
         if self.selected.is_some_and(|id| self.item(id).is_none()) {
             self.selected = None;
         }
@@ -1101,6 +1150,7 @@ impl Home {
             self.frame_preview = None;
             self.drag_snapshot = None;
             self.page_edge = None;
+            self.pages.end_lift();
         }
 
         HomeAction::Reload { close }
@@ -1165,7 +1215,7 @@ impl Home {
         let (cw, ch) = self.cell();
         let cols = self.columns.max(1);
         let rows = self.rows.max(1);
-        let origin_x = self.page as i32 * self.output.w + self.shift_x();
+        let origin_x = self.page() as i32 * self.output.w + self.shift_x();
         let mut out = Vec::with_capacity(((cols + 1) * (rows + 1)) as usize);
         for r in 0..=rows {
             for c in 0..=cols {
@@ -1178,7 +1228,7 @@ impl Home {
     }
 
     fn page_nearby(&self, page: u32) -> bool {
-        page.abs_diff(self.page) <= 1
+        self.pages.nearby(page)
     }
 
     fn resize_cells(
@@ -1567,7 +1617,7 @@ mod tests {
             path: PathBuf::from("/tmp/homescreen-test.toml"),
             columns: 4,
             rows: 6,
-            page: 0,
+            pages: Pages::default(),
             items,
             output: Size::from((1280, 800)),
             edit: false,
@@ -1589,22 +1639,22 @@ mod tests {
         let mut home = test_home(vec![widget(1, 0, 0, 0), widget(2, 1, 0, 0)]);
         let id = ItemId(1);
         home.start_lift(id, (40.0, 40.0).into());
-        assert_eq!(home.page, 0);
+        assert_eq!(home.page(), 0);
         home.pointer_move((1270.0, 40.0).into());
-        assert_eq!(home.page, 0);
+        assert_eq!(home.page(), 0);
         assert!(home.page_edge.is_some());
         if let Some((_, t0)) = home.page_edge.as_mut() {
             *t0 = Instant::now() - PAGE_EDGE_HOLD - Duration::from_millis(1);
         }
         home.tick();
-        assert_eq!(home.page, 1);
+        assert_eq!(home.page(), 1);
         assert_eq!(home.cells_of(id).page, 1);
     }
 
     #[test]
     fn edge_hold_moves_lifted_item_to_the_previous_page() {
         let mut home = test_home(vec![widget(1, 1, 0, 0), widget(2, 0, 0, 0)]);
-        home.page = 1;
+        home.set_page(1);
         let id = ItemId(1);
         home.start_lift(id, (640.0, 40.0).into());
         home.pointer_move((10.0, 40.0).into());
@@ -1612,8 +1662,17 @@ mod tests {
             *t0 = Instant::now() - PAGE_EDGE_HOLD - Duration::from_millis(1);
         }
         home.tick();
-        assert_eq!(home.page, 0);
+        assert_eq!(home.page(), 0);
         assert_eq!(home.cells_of(id).page, 0);
+    }
+
+    #[test]
+    fn compact_pages_removes_a_middle_hole() {
+        let mut home = test_home(vec![widget(1, 0, 0, 0), widget(2, 2, 0, 0)]);
+        home.compact_pages();
+        assert_eq!(home.cells_of(ItemId(1)).page, 0);
+        assert_eq!(home.cells_of(ItemId(2)).page, 1);
+        assert_eq!(home.page_count(), 2);
     }
 
     #[test]

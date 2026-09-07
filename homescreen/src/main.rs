@@ -3,6 +3,7 @@
 mod chrome;
 mod config;
 mod home;
+mod pages;
 mod present;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
