@@ -21,7 +21,7 @@ use smithay::reexports::calloop::{
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 use smithay::reexports::wayland_server::Resource;
 use smithay::reexports::wayland_server::backend::{ClientData, ClientId, DisconnectReason};
-use smithay::reexports::wayland_server::{Display, DisplayHandle};
+use smithay::reexports::wayland_server::{BindError, Display, DisplayHandle};
 use smithay::utils::{Clock, Logical, Monotonic, Point, SERIAL_COUNTER};
 use smithay::wayland::compositor::{CompositorClientState, CompositorState, with_states};
 use smithay::wayland::cursor_shape::CursorShapeManagerState;
@@ -128,11 +128,21 @@ pub struct State<BackendData: Backend + 'static> {
     pub active_window: Option<WlSurface>,
 }
 
+/// Which well-known name to bind. Does not change layout or protocols.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SocketName {
+    /// `wayland-1` … `wayland-32`.
+    Session,
+    /// `wayland-nest-0` … `wayland-nest-7`.
+    Nest,
+}
+
 impl<BackendData: Backend + 'static> State<BackendData> {
-    pub fn new(
+    pub fn new_with_socket(
         event_loop: &mut EventLoop<'static, Self>,
         display: Display<Self>,
         backend_data: BackendData,
+        socket: SocketName,
     ) -> Self {
         let start_time = Instant::now();
         let dh = display.handle();
@@ -172,7 +182,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         #[cfg(feature = "session")]
         let session = crate::session::Session::new(&dh, event_loop);
 
-        let socket_name = Self::init_wayland_listener(display, event_loop);
+        let socket_name = Self::init_wayland_listener(display, event_loop, socket);
         let loop_signal = event_loop.get_signal();
 
         Self {
@@ -212,8 +222,28 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         }
     }
 
-    fn init_wayland_listener(display: Display<Self>, event_loop: &mut EventLoop<Self>) -> OsString {
-        let listening_socket = ListeningSocketSource::new_auto().unwrap();
+    fn bind_socket(socket: SocketName) -> ListeningSocketSource {
+        match socket {
+            SocketName::Session => ListeningSocketSource::new_auto().unwrap(),
+            SocketName::Nest => {
+                for i in 0..8 {
+                    match ListeningSocketSource::with_name(&format!("wayland-nest-{i}")) {
+                        Ok(source) => return source,
+                        Err(BindError::AlreadyInUse) => {}
+                        Err(err) => panic!("failed to bind nest socket: {err}"),
+                    }
+                }
+                panic!("wayland-nest-0..7 all in use");
+            }
+        }
+    }
+
+    fn init_wayland_listener(
+        display: Display<Self>,
+        event_loop: &mut EventLoop<Self>,
+        socket: SocketName,
+    ) -> OsString {
+        let listening_socket = Self::bind_socket(socket);
         let socket_name = listening_socket.socket_name().to_os_string();
 
         let loop_handle = event_loop.handle();
@@ -477,6 +507,14 @@ impl<BackendData: Backend + 'static> State<BackendData> {
 
 #[cfg(feature = "session")]
 impl<B: Backend + 'static> State<B> {
+    pub fn new(
+        event_loop: &mut EventLoop<'static, Self>,
+        display: Display<Self>,
+        backend_data: B,
+    ) -> Self {
+        Self::new_with_socket(event_loop, display, backend_data, SocketName::Session)
+    }
+
     pub fn update_idle_inhibit(&mut self) {
         self.session
             .idle_inhibiting_surfaces
