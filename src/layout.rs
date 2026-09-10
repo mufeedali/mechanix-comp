@@ -207,6 +207,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
                 self.space.raise_element(&window, false);
             }
         }
+        self.schedule_render();
     }
 }
 
