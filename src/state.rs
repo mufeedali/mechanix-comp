@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::sync::Arc;
@@ -92,6 +93,40 @@ pub struct DndIcon {
     pub offset: Point<i32, Logical>,
 }
 
+/// Whether this output has queued or presented a lock frame for the current lock.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub enum LockFrame {
+    #[default]
+    None,
+    Queued,
+    Presented,
+}
+
+/// Session lock lifecycle. `is_locked()` is true for both `Locking` and `Locked`.
+#[derive(Default)]
+pub enum LockPhase {
+    #[default]
+    Unlocked,
+    Locking(SessionLocker),
+    Locked,
+}
+
+impl LockPhase {
+    pub fn is_locked(&self) -> bool {
+        !matches!(self, Self::Unlocked)
+    }
+}
+
+fn output_lock_frame(output: &Output) -> LockFrame {
+    output.user_data().insert_if_missing(Cell::<LockFrame>::default);
+    output.user_data().get::<Cell<LockFrame>>().unwrap().get()
+}
+
+fn set_output_lock_frame(output: &Output, frame: LockFrame) {
+    output.user_data().insert_if_missing(Cell::<LockFrame>::default);
+    output.user_data().get::<Cell<LockFrame>>().unwrap().set(frame);
+}
+
 pub struct State<BackendData: Backend + 'static> {
     pub socket_name: OsString,
     pub display_handle: DisplayHandle,
@@ -139,7 +174,7 @@ pub struct State<BackendData: Backend + 'static> {
     pub presentation_state: PresentationState,
 
     pub session_lock_state: SessionLockManagerState,
-    pub is_locked: bool,
+    pub lock_phase: LockPhase,
     pub lock_surfaces: Vec<LockSurface>,
     pub viewporter_state: ViewporterState,
     pub foreign_toplevel: ForeignToplevelManagerState,
@@ -164,9 +199,6 @@ pub struct State<BackendData: Backend + 'static> {
     /// The toplevel surface last focused; the fallback keyboard focus when no
     /// layer-shell surface holds it.
     pub active_window: Option<WlSurface>,
-    /// Held between `lock()` and the first submitted locked frame.
-    /// Calling `.lock()` on this sends the `locked` event to the client.
-    pub pending_lock: Option<SessionLocker>,
 }
 
 impl<BackendData: Backend + 'static> State<BackendData> {
@@ -261,7 +293,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
             fifo,
             presentation_state,
             session_lock_state,
-            is_locked: false,
+            lock_phase: LockPhase::Unlocked,
             lock_surfaces: Vec::new(),
             viewporter_state,
             foreign_toplevel,
@@ -277,7 +309,6 @@ impl<BackendData: Backend + 'static> State<BackendData> {
             idle_inhibiting_surfaces: HashSet::new(),
             layer_shell_on_demand_focus: None,
             active_window: None,
-            pending_lock: None,
         }
     }
 
@@ -312,6 +343,10 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         socket_name
     }
 
+    pub fn is_locked(&self) -> bool {
+        self.lock_phase.is_locked()
+    }
+
     /// Queue a redraw on every output; the backend skips ones already pending.
     pub fn schedule_render(&mut self) {
         let outputs: Vec<Output> = self.space.outputs().cloned().collect();
@@ -322,7 +357,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
 
     /// Send frame callbacks for a presented frame; `now` is its presentation time.
     pub fn send_frame_callbacks(&mut self, output: &Output, now: Duration) {
-        if self.is_locked {
+        if self.is_locked() {
             // Send frame callbacks only to live surfaces.
             for lock_surface in self.lock_surfaces.iter().filter(|s| s.alive()) {
                 smithay::desktop::utils::send_frames_surface_tree(
@@ -332,12 +367,6 @@ impl<BackendData: Backend + 'static> State<BackendData> {
                     Some(Duration::ZERO),
                     |_, _| Some(output.clone()),
                 );
-            }
-
-            // Send `locked` once a live lock surface has been registered.
-            let has_live_surface = self.lock_surfaces.iter().any(|s| s.alive());
-            if has_live_surface && let Some(locker) = self.pending_lock.take() {
-                locker.lock();
             }
         } else {
             let scale = output.current_scale().fractional_scale();
@@ -356,6 +385,43 @@ impl<BackendData: Backend + 'static> State<BackendData> {
                 });
                 self.push_fractional_scale(layer_surface.wl_surface(), scale);
             }
+        }
+    }
+
+    pub fn lock_frame_queued(&mut self, output: &Output) {
+        if self.is_locked() {
+            set_output_lock_frame(output, LockFrame::Queued);
+        }
+    }
+
+    pub fn lock_frame_presented(&mut self, output: &Output) {
+        if output_lock_frame(output) != LockFrame::Queued {
+            return;
+        }
+        set_output_lock_frame(output, LockFrame::Presented);
+        self.maybe_send_locked();
+    }
+
+    /// Send `locked` if every on output has already presented.
+    pub fn maybe_send_locked(&mut self) {
+        let LockPhase::Locking(_) = self.lock_phase else {
+            return;
+        };
+        let done = self
+            .space
+            .outputs()
+            .filter(|output| !self.output_power.is_off(output))
+            .all(|output| output_lock_frame(output) == LockFrame::Presented);
+        if done && let LockPhase::Locking(locker) =
+            std::mem::replace(&mut self.lock_phase, LockPhase::Locked)
+        {
+            locker.lock();
+        }
+    }
+
+    pub fn reset_lock_frames(&self) {
+        for output in self.space.outputs() {
+            set_output_lock_frame(output, LockFrame::None);
         }
     }
 
@@ -390,7 +456,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         for layer in layer_map_for_output(output).layers() {
             layer.with_surfaces(&mut f);
         }
-        if self.is_locked {
+        if self.is_locked() {
             for lock_surface in self.lock_surfaces.iter().filter(|s| s.alive()) {
                 with_surfaces_surface_tree(lock_surface.wl_surface(), &mut f);
             }
@@ -640,7 +706,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
     /// Recompute keyboard focus from the layer-shell priority list and apply it
     /// if it changed. Called each frame from the backends' idle callbacks.
     pub fn update_keyboard_focus(&mut self) {
-        if self.is_locked {
+        if self.is_locked() {
             return;
         }
         let keyboard = self.seat.get_keyboard().unwrap();
