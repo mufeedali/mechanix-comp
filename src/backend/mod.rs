@@ -1,5 +1,7 @@
 use std::time::Duration;
 
+use smithay::backend::drm::DrmNode;
+use smithay::backend::egl::{EGLDevice, EGLDisplay};
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::output::Output;
 use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
@@ -41,6 +43,13 @@ pub fn snap_scale(scale: f64) -> f64 {
     (scale * 120.0).round() / 120.0
 }
 
+/// The render node EGL actually opened (kmsro: not the display GPU's node).
+pub fn egl_render_node(display: &EGLDisplay) -> Option<DrmNode> {
+    EGLDevice::device_for_display(display)
+        .ok()
+        .and_then(|device| device.try_get_render_node().ok().flatten())
+}
+
 /// Output refresh interval from the current mode, if known.
 pub fn output_refresh(output: &Output) -> Option<Duration> {
     output
@@ -48,6 +57,7 @@ pub fn output_refresh(output: &Output) -> Option<Duration> {
         .filter(|mode| mode.refresh > 0)
         .map(|mode| Duration::from_secs_f64(1000.0 / mode.refresh as f64))
 }
+
 /// The `MECHA_SCALE` override, if set.
 pub fn env_scale() -> Option<f64> {
     std::env::var("MECHA_SCALE")
