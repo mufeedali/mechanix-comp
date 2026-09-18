@@ -45,6 +45,7 @@ use smithay::wayland::shell::wlr_layer::{KeyboardInteractivity, Layer, WlrLayerS
 use smithay::wayland::shell::xdg::XdgShellState;
 use smithay::wayland::shell::xdg::decoration::XdgDecorationState;
 use smithay::wayland::shm::ShmState;
+use smithay::wayland::single_pixel_buffer::SinglePixelBufferState;
 use smithay::wayland::socket::ListeningSocketSource;
 use smithay::wayland::viewporter::ViewporterState;
 
@@ -53,7 +54,9 @@ use smithay::wayland::idle_inhibit::IdleInhibitManagerState;
 use smithay::wayland::idle_notify::IdleNotifierState;
 use smithay::wayland::input_method::InputMethodManagerState;
 use smithay::wayland::selection::data_device::DataDeviceState;
+use smithay::wayland::selection::primary_selection::PrimarySelectionState;
 use smithay::wayland::selection::wlr_data_control::DataControlState;
+use smithay::wayland::xdg_foreign::XdgForeignState;
 use smithay::wayland::session_lock::SessionLockManagerState;
 use smithay::wayland::shell::xdg::dialog::XdgDialogState;
 use smithay::wayland::text_input::TextInputManagerState;
@@ -161,7 +164,9 @@ pub struct State<BackendData: Backend + 'static> {
     pub popups: PopupManager,
     pub xdg_activation_state: XdgActivationState,
     pub data_device_state: DataDeviceState,
+    pub primary_selection_state: PrimarySelectionState,
     pub data_control_state: DataControlState,
+    pub xdg_foreign_state: XdgForeignState,
     pub session_lock_state: SessionLockManagerState,
     pub foreign_toplevel: ForeignToplevelManagerState,
     pub foreign_toplevel_list: ForeignToplevelListState,
@@ -252,13 +257,17 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         VirtualKeyboardManagerState::new::<Self, _>(&dh, |_client| true);
         let xdg_activation_state = XdgActivationState::new::<Self>(&dh);
         let data_device_state = DataDeviceState::new::<Self>(&dh);
+        let primary_selection_state = PrimarySelectionState::new::<Self>(&dh);
+        let data_control_state =
+            DataControlState::new::<Self, _>(&dh, Some(&primary_selection_state), |_| true);
+        let xdg_foreign_state = XdgForeignState::new::<Self>(&dh);
+        SinglePixelBufferState::new::<Self>(&dh);
         let session_lock_state = SessionLockManagerState::new::<Self, _>(&dh, |_| true);
         let foreign_toplevel = ForeignToplevelManagerState::new::<Self>(&dh);
         let foreign_toplevel_list = ForeignToplevelListState::new::<Self>(&dh);
         XdgDialogState::new::<Self>(&dh);
         let idle_notifier_state = IdleNotifierState::new(&dh, event_loop.handle());
         IdleInhibitManagerState::new::<Self>(&dh);
-        let data_control_state = DataControlState::new::<Self, _>(&dh, None, |_| true);
         let output_power = OutputPowerManagerState::new::<Self>(&dh);
 
         let socket_name = Self::init_wayland_listener(display, event_loop);
@@ -268,6 +277,8 @@ impl<BackendData: Backend + 'static> State<BackendData> {
             socket_name,
             xdg_activation_state,
             data_device_state,
+            primary_selection_state,
+            xdg_foreign_state,
             session_lock_state,
             foreign_toplevel,
             foreign_toplevel_list,

@@ -13,6 +13,7 @@ pub mod session_lock;
 pub mod shm;
 pub mod xdg_activation;
 pub mod xdg_dialog;
+pub mod xdg_foreign;
 pub mod xdg_shell;
 pub mod xdg_toplevel_icon;
 
