@@ -95,24 +95,30 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         .window()
         .set_cursor_visible(false);
 
-    // Advertise dmabuf feedback; needs an EGL render node.
+    // Advertise dmabuf feedback when a render node exists, else v3.
     let formats = state.backend_data.renderer().dmabuf_formats();
-    if let Some(node) =
-        crate::backend::egl_render_node(state.backend_data.renderer().egl_context().display())
-    {
-        let feedback = DmabufFeedbackBuilder::new(node.dev_id(), formats)
-            .build()
-            .unwrap();
-        state.dmabuf_global = Some(
-            state
-                .dmabuf_state
-                .create_global_with_default_feedback::<State<WinitData>>(
-                    &state.display_handle,
-                    &feedback,
-                ),
-        );
-    } else {
-        warn!("no EGL render node, not advertising zwp_linux_dmabuf_v1");
+    match crate::backend::egl_render_node(state.backend_data.renderer().egl_context().display()) {
+        Some(node) => {
+            let feedback = DmabufFeedbackBuilder::new(node.dev_id(), formats)
+                .build()
+                .unwrap();
+            state.dmabuf_global = Some(
+                state
+                    .dmabuf_state
+                    .create_global_with_default_feedback::<State<WinitData>>(
+                        &state.display_handle,
+                        &feedback,
+                    ),
+            );
+        }
+        None => {
+            warn!("no EGL render node; advertising zwp_linux_dmabuf_v1 v3");
+            state.dmabuf_global = Some(
+                state
+                    .dmabuf_state
+                    .create_global::<State<WinitData>>(&state.display_handle, formats),
+            );
+        }
     }
 
     let mode = Mode {
