@@ -53,7 +53,7 @@ impl<BackendData: Backend + 'static> CompositorHandler for State<BackendData> {
                 (commit_deadline, acquire_point, dmabuf)
             });
 
-            // `wp_commit_timing`: arm a wakeup at the client's requested commit time.
+            // wp_commit_timing: arm the earliest pending deadline.
             if let Some(commit_deadline) = commit_deadline {
                 let earliest = state
                     .next_commit_deadline()

@@ -541,6 +541,7 @@ impl State<UdevData> {
             };
 
             if self.dmabuf_global.is_none() {
+                // Import on the render node EGL uses (kmsro: not the display card).
                 let import_node = egl_device
                     .and_then(|device| device.try_get_render_node().ok().flatten())
                     .or_else(|| node.node_with_type(NodeType::Render).and_then(|r| r.ok()))

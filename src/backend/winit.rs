@@ -95,6 +95,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         .window()
         .set_cursor_visible(false);
 
+    // Advertise dmabuf feedback; needs an EGL render node.
     let formats = state.backend_data.renderer().dmabuf_formats();
     if let Some(node) =
         crate::backend::egl_render_node(state.backend_data.renderer().egl_context().display())
