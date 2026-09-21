@@ -2,6 +2,7 @@ pub mod compositor;
 pub mod data_control;
 pub mod data_device;
 pub mod dmabuf;
+pub mod drm_syncobj;
 pub mod foreign_toplevel;
 pub mod fractional_scale;
 pub mod idle;

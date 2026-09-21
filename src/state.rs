@@ -18,7 +18,7 @@ use smithay::input::pointer::{CursorImageStatus, PointerHandle};
 use smithay::input::{Seat, SeatState};
 use smithay::output::Output;
 use smithay::reexports::calloop::{
-    EventLoop, Interest, LoopSignal, Mode, PostAction, generic::Generic,
+    EventLoop, Interest, LoopHandle, LoopSignal, Mode, PostAction, generic::Generic,
 };
 use smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback;
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
@@ -36,6 +36,7 @@ use smithay::wayland::compositor::{
 };
 use smithay::wayland::cursor_shape::CursorShapeManagerState;
 use smithay::wayland::dmabuf::{DmabufGlobal, DmabufState};
+use smithay::wayland::drm_syncobj::DrmSyncobjState;
 use smithay::wayland::fifo::{FifoBarrierCachedState, FifoManagerState};
 use smithay::wayland::fractional_scale::{FractionalScaleManagerState, with_fractional_scale};
 use smithay::wayland::output::OutputManagerState;
@@ -56,12 +57,12 @@ use smithay::wayland::input_method::InputMethodManagerState;
 use smithay::wayland::selection::data_device::DataDeviceState;
 use smithay::wayland::selection::primary_selection::PrimarySelectionState;
 use smithay::wayland::selection::wlr_data_control::DataControlState;
-use smithay::wayland::xdg_foreign::XdgForeignState;
 use smithay::wayland::session_lock::SessionLockManagerState;
 use smithay::wayland::shell::xdg::dialog::XdgDialogState;
 use smithay::wayland::text_input::TextInputManagerState;
 use smithay::wayland::virtual_keyboard::VirtualKeyboardManagerState;
 use smithay::wayland::xdg_activation::XdgActivationState;
+use smithay::wayland::xdg_foreign::XdgForeignState;
 use smithay::wayland::xdg_toplevel_icon::XdgToplevelIconManager;
 
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
@@ -148,6 +149,7 @@ pub struct State<BackendData: Backend + 'static> {
     pub display_handle: DisplayHandle,
 
     pub space: Space<Window>,
+    pub loop_handle: LoopHandle<'static, Self>,
     pub loop_signal: LoopSignal,
 
     /// All xdg toplevels ever created, keyed by `wl_surface`, whether or not
@@ -189,6 +191,7 @@ pub struct State<BackendData: Backend + 'static> {
     pub backend_data: BackendData,
     pub dmabuf_state: DmabufState,
     pub dmabuf_global: Option<DmabufGlobal>,
+    pub drm_syncobj_state: Option<DrmSyncobjState>,
     pub lock_phase: LockPhase,
     pub lock_surfaces: Vec<LockSurface>,
     pub lock_surface_outputs: HashMap<ObjectId, Output>,
@@ -289,7 +292,9 @@ impl<BackendData: Backend + 'static> State<BackendData> {
             display_handle: dh,
             space,
             toplevels: HashMap::new(),
+            loop_handle: event_loop.handle(),
             loop_signal,
+            drm_syncobj_state: None,
             compositor_state,
             xdg_shell_state,
             layer_shell_state,

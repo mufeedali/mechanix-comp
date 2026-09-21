@@ -96,9 +96,9 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         .set_cursor_visible(false);
 
     let formats = state.backend_data.renderer().dmabuf_formats();
-    if let Some(node) = crate::backend::egl_render_node(
-        state.backend_data.renderer().egl_context().display(),
-    ) {
+    if let Some(node) =
+        crate::backend::egl_render_node(state.backend_data.renderer().egl_context().display())
+    {
         let feedback = DmabufFeedbackBuilder::new(node.dev_id(), formats)
             .build()
             .unwrap();
