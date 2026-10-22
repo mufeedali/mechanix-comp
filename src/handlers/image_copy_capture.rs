@@ -30,7 +30,7 @@ use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::{
     Buffer as BufferCoords, IsAlive, Logical, Physical, Point, Rectangle, Scale, Size, Transform,
 };
-use smithay::wayland::compositor::with_states;
+use smithay::wayland::compositor::{get_parent, with_states};
 use smithay::wayland::dmabuf::get_dmabuf;
 use smithay::wayland::foreign_toplevel_list::ForeignToplevelHandle;
 use smithay::wayland::image_capture_source::{
@@ -384,17 +384,8 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         {
             return;
         }
-        let toplevel = if self.toplevels.contains_key(root) {
-            root.clone()
-        } else {
-            match self
-                .popups
-                .find_popup(root)
-                .map(|popup| find_popup_root_surface(&popup))
-            {
-                Some(Ok(toplevel)) => toplevel,
-                _ => return,
-            }
+        let Some(toplevel) = self.toplevel_of(root) else {
+            return;
         };
         let mut recorded = false;
         for index in 0..self.capture_sessions.len() {
@@ -406,6 +397,18 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         if recorded {
             self.wake_recorded_toplevel(&toplevel);
         }
+    }
+
+    /// The toplevel a surface belongs to, through subsurfaces and popups.
+    fn toplevel_of(&self, surface: &WlSurface) -> Option<WlSurface> {
+        let mut root = surface.clone();
+        while let Some(parent) = get_parent(&root) {
+            root = parent;
+        }
+        if self.toplevels.contains_key(&root) {
+            return Some(root);
+        }
+        find_popup_root_surface(&self.popups.find_popup(&root)?).ok()
     }
 
     /// Give a recorded hidden toplevel one frame callback per refresh.
@@ -515,12 +518,16 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         })
     }
 
-    /// The cursor's position in `window`'s capture, if it's over the window.
+    /// The cursor's position in `window`'s capture, if it's over it on screen.
     fn cursor_over(&self, window: &Window) -> Option<Point<i32, Logical>> {
         let pointer = self.pointer.current_location();
-        let (under, _) = self.space.element_under(pointer)?;
+        // The same hit test as input, so layers and hidden windows count.
+        let (under, _) = self.surface_under(pointer)?;
+        if self.toplevel_of(&under)? != *window.toplevel()?.wl_surface() {
+            return None;
+        }
         let origin = self.space.element_location(window)?;
-        (under == window).then(|| pointer.to_i32_round() - origin - self.cursor_hotspot())
+        Some(pointer.to_i32_round() - origin - self.cursor_hotspot())
     }
 
     /// Re-check toplevel captures that paint the cursor; it may have moved.
